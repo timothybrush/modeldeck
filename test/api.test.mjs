@@ -30,6 +30,7 @@ async function startFixture(serviceOptions = {}, { listen = true } = {}) {
   fs.chmodSync(path.dirname(codexHome), 0o700);
   fs.writeFileSync(path.join(projectsRoot, 'loanmeld', 'package.json'), JSON.stringify({ name: 'loanmeld' }));
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   store.saveAccount({ provider: 'claude', label: 'Business', profileRef: claudeHome, isDefault: true });
   const service = new ModelDeckService(store, {
     projectsRoot,
@@ -136,6 +137,193 @@ async function directRequest(fixture, route, {
 
 async function directGet(fixture, route, options) {
   return directRequest(fixture, route, options);
+}
+
+for (const provider of ['claude', 'codex']) {
+  test(`profile-exists: ${provider} asks before reattaching an unregistered base folder`, async (t) => {
+    const fixture = await startFixture({
+      exec: async () => ({ stdout: '2.1.215' }),
+      readClaudeTier: async () => null,
+      readClaudeIdentity: async () => null,
+    }, { listen: false });
+    t.after(() => { fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+    const profilesDir = provider === 'claude' ? fixture.service.claudeProfilesDir : fixture.service.codexProfilesDir;
+    const profileRef = path.join(fs.realpathSync(profilesDir), 'sample-work');
+    const transcript = path.join(profileRef, 'projects', 'sample', 'nested', 'session.jsonl');
+    fs.mkdirSync(path.dirname(transcript), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(transcript, 'original transcript\n');
+    fs.writeFileSync(path.join(profileRef, 'auth.json'), 'not a credential');
+    fs.writeFileSync(path.join(profileRef, 'CLAUDE.md'), 'User instructions\n');
+    const modifiedAt = new Date('2026-09-10T12:00:00.000Z');
+    fs.utimesSync(profileRef, modifiedAt, modifiedAt);
+    const before = treeMetadata(profileRef);
+    const input = { provider, label: 'Sample Work', purpose: 'fixture' };
+    const accountsBefore = fixture.store.listAccounts().length;
+
+    // Discovery can list names and metadata, but must never open user files.
+    const reads = t.mock.method(fs.promises, 'readFile', async () => { throw new Error('profile discovery opened a file'); });
+    const blocked = await directRequest(fixture, '/api/accounts', { method: 'POST', body: input });
+    reads.mock.restore();
+    assert.equal(blocked.response.status, 409);
+    assert.equal(blocked.body.code, 'profile-exists');
+    assert.equal(blocked.body.profile.path, profileRef);
+    assert.equal(blocked.body.profile.name, 'sample-work');
+    assert.equal(blocked.body.profile.transcripts, provider === 'claude' ? 1 : 0);
+    assert.equal(blocked.body.profile.lastModified, modifiedAt.toISOString());
+    if (provider === 'codex') assert.equal(blocked.body.profile.hasCredential, true);
+    assert.equal(reads.mock.callCount(), 0);
+    assert.deepEqual(treeMetadata(profileRef), before);
+    assert.equal(fixture.store.listAccounts().length, accountsBefore);
+    assert.equal(fs.existsSync(`${profileRef}-2`), false);
+
+    const fresh = await directRequest(fixture, '/api/accounts', { method: 'POST', body: { ...input, existingProfile: 'fresh' } });
+    assert.equal(fresh.response.status, 201);
+    assert.equal(fresh.body.account.profileRef, `${profileRef}-2`);
+    assert.ok(fresh.body.profileNote.includes(profileRef));
+    assert.deepEqual(treeMetadata(profileRef), before);
+
+    fs.chmodSync(profileRef, 0o755);
+    const adopted = await directRequest(fixture, '/api/accounts', { method: 'POST', body: { ...input, existingProfile: 'adopt' } });
+    assert.equal(adopted.response.status, 201);
+    assert.equal(adopted.body.account.profileRef, profileRef);
+    assert.equal(fs.statSync(profileRef).mode & 0o777, 0o700);
+    assert.equal(fs.readFileSync(transcript, 'utf8'), 'original transcript\n');
+    assert.ok(fs.readFileSync(path.join(profileRef, 'CLAUDE.md'), 'utf8').endsWith('User instructions\n'));
+
+    const second = await directRequest(fixture, '/api/accounts', { method: 'POST', body: input });
+    assert.equal(second.response.status, 201, 'a registered base is a genuine second account, without a prompt');
+    assert.equal(second.body.account.profileRef, `${profileRef}-3`);
+    const taken = await directRequest(fixture, '/api/accounts', { method: 'POST', body: { ...input, existingProfile: 'adopt' } });
+    assert.equal(taken.response.status, 409, 'an explicit adoption cannot share a registered home');
+  });
+
+  test(`profile-exists: ${provider} refuses unsafe adoption and preserves an orphan on failure`, async (t) => {
+    const fixture = await startFixture({
+      exec: async () => ({ stdout: '2.1.215' }),
+      readClaudeTier: async () => null,
+      readClaudeIdentity: async () => null,
+    }, { listen: false });
+    t.after(() => { fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+    const profilesDir = provider === 'claude' ? fixture.service.claudeProfilesDir : fixture.service.codexProfilesDir;
+    const profileRef = path.join(fs.realpathSync(profilesDir), 'sample');
+    const outside = path.join(fixture.root, 'outside');
+    fs.mkdirSync(outside, { mode: 0o755 });
+    fs.writeFileSync(path.join(outside, 'session.jsonl'), 'preserve me');
+    const beforeOutside = treeMetadata(outside);
+    const input = { provider, label: 'Sample', existingProfile: 'adopt' };
+
+    fs.symlinkSync(outside, profileRef);
+    let result = await directRequest(fixture, '/api/accounts', { method: 'POST', body: input });
+    assert.equal(result.response.status, 400);
+    assert.match(result.body.error, /real directory/);
+    assert.deepEqual(treeMetadata(outside), beforeOutside);
+    fs.unlinkSync(profileRef);
+    fs.mkdirSync(profileRef, { mode: 0o700 });
+    fs.symlinkSync(outside, path.join(profileRef, 'projects'));
+    result = await directRequest(fixture, '/api/accounts', { method: 'POST', body: { provider, label: 'Sample' } });
+    assert.equal(result.body.profile.transcripts, 0, 'discovery never traverses a linked projects folder');
+    result = await directRequest(fixture, '/api/accounts', { method: 'POST', body: input });
+    assert.equal(result.response.status, 400);
+    assert.match(result.body.error, /symbolic link/);
+    assert.deepEqual(treeMetadata(outside), beforeOutside);
+    fs.unlinkSync(path.join(profileRef, 'projects'));
+
+    result = await directRequest(fixture, '/api/accounts', { method: 'POST', body: { ...input, existingProfile: 'invalid' } });
+    assert.equal(result.response.status, 400);
+    assert.equal(fs.existsSync(`${profileRef}-2`), false);
+
+    const transcript = path.join(profileRef, 'session.jsonl');
+    fs.writeFileSync(transcript, 'original history');
+    const originalCount = fixture.store.listAccounts().length;
+    const failure = t.mock.method(fixture.service, 'setDefaultAccount', () => { throw new Error('injected save failure'); });
+    result = await directRequest(fixture, '/api/accounts', { method: 'POST', body: { ...input, isDefault: true } });
+    failure.mock.restore();
+    assert.equal(result.response.status, 400);
+    assert.match(result.body.error, /injected save failure/);
+    assert.equal(fixture.store.listAccounts().length, originalCount);
+    assert.equal(fs.readFileSync(transcript, 'utf8'), 'original history');
+  });
+
+  test(`profile-exists: ${provider} checks only the exact base name and serializes competing adoptions`, async (t) => {
+    const fixture = await startFixture({
+      exec: async () => ({ stdout: '2.1.215' }),
+      readClaudeTier: async () => null,
+      readClaudeIdentity: async () => null,
+    }, { listen: false });
+    t.after(() => { fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+    const profilesDir = provider === 'claude' ? fixture.service.claudeProfilesDir : fixture.service.codexProfilesDir;
+    const profileRef = path.join(fs.realpathSync(profilesDir), 'sample');
+    fs.mkdirSync(`${profileRef}-2`, { mode: 0o700 });
+    let result = await directRequest(fixture, '/api/accounts', { method: 'POST', body: { provider, label: 'Sample' } });
+    assert.equal(result.response.status, 201, 'numbered orphans alone do not cause a prompt');
+    assert.equal(result.body.account.profileRef, profileRef);
+    fixture.store.deleteAccount(result.body.account.id);
+
+    const results = await Promise.all([0, 1].map(() => directRequest(fixture, '/api/accounts', {
+      method: 'POST', body: { provider, label: 'Sample', existingProfile: 'adopt' },
+    })));
+    assert.deepEqual(results.map((entry) => entry.response.status).sort(), [201, 409]);
+    assert.equal(fixture.store.listAccounts().filter((account) => account.profileRef === profileRef).length, 1);
+    assert.equal(fs.existsSync(profileRef), true);
+  });
+
+  test(`profile-exists: ${provider} recognizes registered folders with different capitalization`, async (t) => {
+    const fixture = await startFixture({
+      exec: async () => ({ stdout: '2.1.215' }),
+      readClaudeTier: async () => null,
+      readClaudeIdentity: async () => null,
+    }, { listen: false });
+    t.after(() => { fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+    const profilesDir = provider === 'claude' ? fixture.service.claudeProfilesDir : fixture.service.codexProfilesDir;
+    const profileRef = path.join(fs.realpathSync(profilesDir), 'Sample-Work');
+    fs.mkdirSync(profileRef, { mode: 0o700 });
+    if (!fs.existsSync(path.join(profilesDir, 'sample-work'))) return t.skip('requires a case-insensitive filesystem');
+    fixture.store.saveAccount({ provider, label: 'First', profileRef });
+    const input = { provider, label: 'Sample Work' };
+    const refused = await directRequest(fixture, '/api/accounts', { method: 'POST', body: { ...input, existingProfile: 'adopt' } });
+    assert.equal(refused.response.status, 409);
+    const second = await directRequest(fixture, '/api/accounts', { method: 'POST', body: input });
+    assert.equal(second.response.status, 201);
+    assert.equal(path.basename(second.body.account.profileRef), 'sample-work-2');
+  });
+}
+
+for (const suffix of [false, true]) {
+  test(`profile-exists: a ${suffix ? 'numbered' : 'base'} folder still being created cannot be adopted before failure cleanup`, async (t) => {
+    let releaseCreation;
+    let reachedExplainer;
+    const paused = new Promise((resolve) => { reachedExplainer = resolve; });
+    const release = new Promise((resolve) => { releaseCreation = resolve; });
+    let calls = 0;
+    const fixture = await startFixture({
+      exec: async () => ({ stdout: '2.1.215' }),
+      readClaudeTier: async () => null,
+      readClaudeIdentity: async () => null,
+      reconcileClaudeProfileExplainer: async () => { if (++calls === 1) { reachedExplainer(); await release; } },
+    }, { listen: false });
+    const originalProfileChanged = fixture.service.accountProfileSetChanged.bind(fixture.service);
+    fixture.service.accountProfileSetChanged = async () => {
+      if (calls === 1) throw new Error('injected profile reconciliation failure');
+      return originalProfileChanged();
+    };
+    t.after(() => { fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+    const input = { provider: 'claude', label: 'Pending', ...(suffix ? { existingProfile: 'fresh' } : {}) };
+    if (suffix) fs.mkdirSync(path.join(fixture.service.claudeProfilesDir, 'pending'), { mode: 0o700 });
+    const creating = directRequest(fixture, '/api/accounts', { method: 'POST', body: input });
+    await paused;
+    let adopting;
+    try {
+      adopting = await directRequest(fixture, '/api/accounts', {
+        method: 'POST', body: { ...input, label: suffix ? 'Pending-2' : 'Pending', existingProfile: 'adopt' },
+      });
+    } finally { releaseCreation(); }
+    await creating;
+    assert.equal(adopting.response.status, 409);
+    assert.match(adopting.body.error, /being added/);
+    fixture.service.accountProfileSetChanged = originalProfileChanged;
+    const retried = await directRequest(fixture, '/api/accounts', { method: 'POST', body: input });
+    assert.equal(retried.response.status, 201, 'failed creation releases the reservation');
+  });
 }
 
 function claudeSnapshotsExpiringAt(expiresAt) {
@@ -1484,6 +1672,8 @@ test('settings API validates partial updates and drives worst-capacity threshold
 
   let result = await request(fixture, '/api/settings');
   assert.deepEqual(result.body, {
+    claudeManaged: true,
+    codexManaged: true,
     autoRefreshEnabled: true,
     autoRenewEnabled: true,
     otelReceiverEnabled: false,

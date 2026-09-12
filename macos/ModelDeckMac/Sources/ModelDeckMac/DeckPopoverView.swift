@@ -1189,18 +1189,28 @@ struct MemberBlackoutBannerRow: View {
         // stops shouting, drops the remedy it no longer needs, and says what
         // it is actually waiting for.
         let repaired = alert.isRepairedPending
+        // Issue #572: an overload-class streak shares the #539 quiet shape —
+        // same evidence line, gray, waiting icon, no promoted repair. The
+        // daemon's remedy sentence (no action needed) rides the tooltip.
+        // Issue #634: a resting (rate-limited) member takes the same shape.
+        let restingText = account.flatMap { account in
+            account.proxyCredential?.lowercased() == "resting"
+                ? ProxyRelogin.credentialText(for: account) : nil
+        }
+        let quiet = restingText != nil || repaired || alert.isTransient
         // Issue #537 (Tim): one line, no remedy sentence — the inline action
         // IS the remedy. The full story stays in the tooltip and the
         // accessibility label, where it costs no deck space.
-        let visible = repaired ? alert.repairedStatusLine : "\(alert.statusLine)\(httpStatus)"
-        let message = repaired
+        let visible = restingText.map { "\(alert.label): \($0)" }
+            ?? (repaired ? alert.repairedStatusLine : "\(alert.statusLine)\(httpStatus)")
+        let message = restingText != nil ? visible : (repaired
             ? "\(alert.repairedStatusLine). \(alert.repairedDetail)"
-            : "\(visible). \(alert.remedy)"
-        let icon = repaired ? "clock.arrow.circlepath" : "exclamationmark.octagon.fill"
+            : "\(visible). \(alert.remedy)")
+        let icon = quiet ? "clock.arrow.circlepath" : "exclamationmark.octagon.fill"
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Label(visible, systemImage: icon)
                 .font(.caption)
-                .foregroundStyle(repaired ? Color.secondary : Color.red)
+                .foregroundStyle(quiet ? Color.secondary : Color.red)
                 // CodeRabbit (PR #538): statusLine embeds the account label,
                 // which is unbounded — without a limit a long label wraps the
                 // banner back into the multi-line shape #537 removed. The
@@ -1212,10 +1222,10 @@ struct MemberBlackoutBannerRow: View {
                 .help(message)
                 .accessibilityLabel("Pool alert. \(message)")
             Spacer(minLength: 0)
-            // Issue #539: in the soft state there is nothing to fix, so no
-            // action is offered — but a sign-in actually running still shows
-            // its progress and its Stop.
-            if !repaired || relogin?.display.isRunning == true {
+            // Issues #539/#572/#634: in the quiet states there is nothing to
+            // fix, so no action is offered — but a sign-in actually running
+            // still shows its progress and its Stop.
+            if !quiet || relogin?.display.isRunning == true {
                 repairControl
             }
         }

@@ -105,10 +105,7 @@ private func poolAllRouted() -> DeckState {
 @MainActor
 struct Issue321NoOpCalloutTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "issue321-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("issue321-tests")
     }
 
     // MARK: Copy — mode-honest, with #330's configuration-aware line

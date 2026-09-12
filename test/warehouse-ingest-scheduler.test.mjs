@@ -125,6 +125,7 @@ test('TRIPWIRE: settings API immediately reschedules warehouse ingest when analy
   const reschedules = [];
   const service = {
     projectsRoot: '/tmp/modeldeck-warehouse-settings-placeholder',
+    updateSettings: async (input) => store.saveSettings(input),
     applySharedScopeSettings: async () => {},
     rescheduleAutoRefresh() {},
     rescheduleUsageQueueConsumer: async () => {},

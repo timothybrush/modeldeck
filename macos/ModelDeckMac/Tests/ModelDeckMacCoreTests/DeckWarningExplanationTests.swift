@@ -13,7 +13,7 @@ import Testing
 @MainActor
 struct WarningPresentationStateTests {
     private func model() -> DeckPopoverModel {
-        let defaults = UserDefaults(suiteName: "warning-tests-\(UUID().uuidString)")!
+        let defaults = ScratchDefaults.make("warning-tests")
         return DeckPopoverModel(defaults: defaults)
     }
 
@@ -455,7 +455,7 @@ struct FooterFreshnessExplanationTests {
 @MainActor
 struct SignInAgainActionTests {
     private func model() -> DeckPopoverModel {
-        let defaults = UserDefaults(suiteName: "signin-again-tests-\(UUID().uuidString)")!
+        let defaults = ScratchDefaults.make("signin-again-tests")
         return DeckPopoverModel(defaults: defaults)
     }
 
@@ -612,7 +612,7 @@ struct SignInAgainActionTests {
 @MainActor
 struct DuplicateReloginActionTests {
     private func model() -> DeckPopoverModel {
-        let defaults = UserDefaults(suiteName: "dup-relogin-tests-\(UUID().uuidString)")!
+        let defaults = ScratchDefaults.make("dup-relogin-tests")
         return DeckPopoverModel(defaults: defaults)
     }
 
@@ -721,7 +721,7 @@ struct DuplicateReloginActionTests {
 @MainActor
 struct StaleRefreshActionTests {
     private func model() -> DeckPopoverModel {
-        let defaults = UserDefaults(suiteName: "stale-refresh-tests-\(UUID().uuidString)")!
+        let defaults = ScratchDefaults.make("stale-refresh-tests")
         return DeckPopoverModel(defaults: defaults)
     }
 

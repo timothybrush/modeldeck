@@ -241,10 +241,7 @@ struct AppUpdateAutoCheckerTests {
     }
 
     private func freshDefaults() -> UserDefaults {
-        let suite = "auto-update-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("auto-update-tests")
     }
 
     private func makeChecker(

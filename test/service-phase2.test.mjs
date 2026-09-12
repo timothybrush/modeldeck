@@ -20,6 +20,7 @@ function fixture(options = {}) {
   fs.chmodSync(firstHome, 0o700);
   fs.chmodSync(secondHome, 0o700);
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const codexActiveLink = path.join(root, 'active', '.codex');
   const claudeActiveLink = path.join(root, 'active', '.claude');
   const service = new ModelDeckService(store, {
@@ -802,13 +803,14 @@ test('account creation refuses up front, with install guidance, when the provide
   });
 });
 
-test('a leftover profile directory falls through to a suffixed home instead of dead-ending the retry', async () => {
+test('starting fresh explicitly leaves a leftover profile directory and uses a suffixed home', async () => {
   const data = fixture({ exec: cliInstalledExec });
   try {
     fs.mkdirSync(path.join(data.root, 'profiles', 'exist12'), { mode: 0o700 });
-    const created = await data.service.createClaudeAccount({ label: 'Exist12' });
+    const created = await data.service.createClaudeAccount({ label: 'Exist12', existingProfile: 'fresh' });
     assert.equal(path.basename(created.profileRef), 'exist12-2');
     assert.equal(fs.statSync(created.profileRef).mode & 0o777, 0o700);
+    assert.ok(created.profileNote.includes(path.join(data.root, 'profiles', 'exist12')));
   } finally { data.close(); }
 });
 

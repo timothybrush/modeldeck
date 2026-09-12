@@ -387,7 +387,7 @@ public final class SharedScopeModel: ObservableObject {
         switch error {
         case DaemonClientError.httpStatus(409),
              DaemonClientError.daemonError(_, 409),
-             DaemonClientError.daemonCodedError(_, _, 409):
+             DaemonClientError.daemonCodedError(_, _, 409, _):
             return true
         default:
             return false

@@ -83,6 +83,7 @@ function fixture(options = {}) {
   fs.symlinkSync(priorHome, activeLink, 'dir');
 
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const calls = [];
   const service = new ModelDeckService(store, {
     claudeProfilesDir: profilesDir,

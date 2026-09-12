@@ -886,10 +886,7 @@ struct DeckBuilderTests {
 @MainActor
 struct DeckPopoverModelTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "deck-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("deck-tests")
     }
 
     @Test func defaultsToTwoColumnAndNextReset() {
@@ -1302,10 +1299,7 @@ private func switchedState(claudeDefault id: String) -> DeckState {
 @MainActor
 struct DeckPopoverModelActivationTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "deck-activation-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("deck-activation-tests")
     }
 
     private func nonActiveClaudeRow(_ model: DeckPopoverModel, id: String = "c2") -> DeckAccountRow {
@@ -1475,10 +1469,7 @@ private func freshInstallSwitched(to id: String) -> DeckState {
 @MainActor
 struct FreshInstallActivationTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "fresh-install-activation-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("fresh-install-activation-tests")
     }
 
     private func claudeRow(_ model: DeckPopoverModel, id: String) -> DeckAccountRow {
@@ -1602,10 +1593,7 @@ private struct FailingStateProvider: DeckStateProviding {
 @MainActor
 struct SilentActivationOutcomeTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "silent-activation-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("silent-activation-tests")
     }
 
     private func claudeRow(_ model: DeckPopoverModel, id: String) -> DeckAccountRow {
@@ -1820,10 +1808,7 @@ struct SilentActivationOutcomeTests {
 @MainActor
 struct DeckMenuBarPinTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "deck-pin-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("deck-pin-tests")
     }
 
     @Test func togglePinPinsThenUnpins() {
@@ -2225,9 +2210,7 @@ struct WeeklyWindowToggleTests {
 @Suite("Deck change tracker")
 struct DeckChangeTrackerTests {
     private func freshDefaults(_ name: String) -> UserDefaults {
-        let defaults = UserDefaults(suiteName: "modeldeck-tests-\(name)")!
-        defaults.removePersistentDomain(forName: "modeldeck-tests-\(name)")
-        return defaults
+        ScratchDefaults.make(name)
     }
 
     private func rows(remaining: Double, scope: String = "week") -> [DeckAccountRow] {

@@ -664,9 +664,7 @@ struct Issue422StoreTests {
 
     @Test("choice and adopted supervision round-trip through UserDefaults")
     func roundTrip() throws {
-        let suite = "modeldeck-onboarding-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
+        let defaults = ScratchDefaults.make("onboarding")
 
         let store = UserDefaultsManagedProxyOnboardingStore(defaults: defaults)
         #expect(store.choice == nil)

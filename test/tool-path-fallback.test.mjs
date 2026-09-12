@@ -23,6 +23,7 @@ function fixture(options = {}) {
   const nativeClaude = path.join(localBin, 'claude-fixture');
   fs.writeFileSync(nativeClaude, '#!/bin/sh\n', { mode: 0o755 });
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const enoent = () => {
     const error = new Error('spawn ENOENT');
     error.code = 'ENOENT';
@@ -91,4 +92,67 @@ test('a CLI absent from PATH and the fallback dirs still reports not installed',
   );
   const tools = await data.service.probeTools();
   assert.match(tools.tools.codex.error, /codex-fixture is not installed/);
+});
+
+// Second sighting (2026-09-11): login resolved the CLI through the fallback
+// and succeeded, then "I've Signed In — Verify" spawned the bare name and
+// reported "Claude Code is not installed". Every daemon-side spawn — verify
+// for both providers, and Claude renewal — must hand the adapter the same
+// resolved executable the login step used. All three VERIFIED TO FAIL
+// against the pre-fix service.mjs.
+function profileHome(root, name) {
+  const home = path.join(root, 'profiles', name);
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.chmodSync(home, 0o700);
+  return home;
+}
+
+test('verify hands the Claude adapter the resolved native-installer path', async (t) => {
+  let seenPath = null;
+  const data = fixture({
+    readClaudeAuth: async ({ claudePath }) => {
+      seenPath = claudePath;
+      return { authenticated: true, identity: 'user@example.invalid' };
+    },
+  });
+  t.after(() => data.close());
+  const account = data.store.saveAccount({
+    provider: 'claude', label: 'Native', profileRef: profileHome(data.root, 'native'),
+  });
+  const result = await data.service.verifyAccount(account.id);
+  assert.equal(result.authenticated, true);
+  assert.equal(seenPath, data.nativeClaude);
+});
+
+test('verify hands the Codex adapter the resolved fallback path', async (t) => {
+  const data = fixture();
+  t.after(() => data.close());
+  const nativeCodex = path.join(data.localBin, 'codex-fixture');
+  fs.writeFileSync(nativeCodex, '#!/bin/sh\n', { mode: 0o755 });
+  let seenBinary = null;
+  data.service.readCodexAuth = async ({ binary }) => {
+    seenBinary = binary;
+    return { authenticated: true, identity: 'user@example.invalid' };
+  };
+  const account = data.store.saveAccount({
+    provider: 'codex', label: 'Native', profileRef: profileHome(data.root, 'codex-native'),
+  });
+  await data.service.verifyAccount(account.id);
+  assert.equal(seenBinary, nativeCodex);
+});
+
+test('Claude renewal spawns the resolved native-installer path, not the bare name', async (t) => {
+  const spawned = [];
+  const data = fixture({
+    exec: async (binary) => {
+      spawned.push(binary);
+      // The daemon's restricted PATH: only an absolute path spawns.
+      if (!path.isAbsolute(binary)) throw Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' });
+      return { stdout: '' };
+    },
+  });
+  t.after(() => data.close());
+  const profileRef = profileHome(data.root, 'renewal');
+  await data.service.runClaudeRenewalCli(['--version'], profileRef);
+  assert.deepEqual(spawned, ['claude-fixture', data.nativeClaude]);
 });

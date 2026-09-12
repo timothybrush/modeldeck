@@ -67,6 +67,7 @@ function fixture(options = {}) {
   }
   fs.chmodSync(profilesDir, 0o700);
   const store = new Store(':memory:');
+  store.saveSettings({ codexManaged: true });
   const insight = store.saveAccount({ provider: 'codex', label: 'Insight', profileRef: homes.insight, isDefault: true });
   const lending = store.saveAccount({ provider: 'codex', label: 'Lending', profileRef: homes.lending });
   const personal = store.saveAccount({ provider: 'codex', label: 'Personal', profileRef: homes.personal });

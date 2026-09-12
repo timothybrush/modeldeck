@@ -47,24 +47,21 @@ struct DaemonConfigurationTests {
     }
 
     @Test func environmentPortWins() {
-        let defaults = UserDefaults(suiteName: "modeldeck-tests-env")!
+        let defaults = ScratchDefaults.make("env")
         defaults.set(4111, forKey: "modeldeck.daemon.port")
-        defer { defaults.removePersistentDomain(forName: "modeldeck-tests-env") }
         let config = DaemonConfiguration.resolved(environment: ["MODELDECK_PORT": "4222"], defaults: defaults)
         #expect(config.port == 4222)
     }
 
     @Test func userDefaultsPortUsedWhenNoEnvironment() {
-        let defaults = UserDefaults(suiteName: "modeldeck-tests-defaults")!
+        let defaults = ScratchDefaults.make("defaults")
         defaults.set(4111, forKey: "modeldeck.daemon.port")
-        defer { defaults.removePersistentDomain(forName: "modeldeck-tests-defaults") }
         let config = DaemonConfiguration.resolved(environment: [:], defaults: defaults)
         #expect(config.port == 4111)
     }
 
     @Test func garbageEnvironmentPortFallsThrough() {
-        let defaults = UserDefaults(suiteName: "modeldeck-tests-garbage")!
-        defaults.removePersistentDomain(forName: "modeldeck-tests-garbage")
+        let defaults = ScratchDefaults.make("garbage")
         let config = DaemonConfiguration.resolved(environment: ["MODELDECK_PORT": "not-a-port"], defaults: defaults)
         #expect(config.port == 3867)
     }

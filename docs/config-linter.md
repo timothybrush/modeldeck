@@ -39,7 +39,7 @@ anything requiring judgment rather than a decidable predicate.
   `src/shared-scope.mjs` already established: OAuth/account bytes are outside
   the boundary), `memory/` link state.
 - The activation symlinks `~/.claude` and `~/.codex`, and the Codex homes under
-  `~/.codex-profiles/` including the identifier-only `tokens.account_id` field
+  `<DATA_DIR>/codex-profiles/` including the identifier-only `tokens.account_id` field
   of each `auth.json` — the same read the daemon's #108 duplicate detection
   already performs; token values never read past the identifier.
 - The shell pinning pair: the generated block in `~/.zshenv` and the env file
@@ -72,7 +72,7 @@ instead of asserting.
 | MD-L01 | `apiKeyHelper` present in a managed profile's `settings.json` (kills the identity read, so auto-renewal silently dies) | error | #263 |
 | MD-L02 | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` set in a managed profile's `settings.json` env | error | #224 |
 | MD-L03 | `ANTHROPIC_BASE_URL` in `settings.json` pointing somewhere other than the expected proxy origin, or present on a profile the proxy roster doesn't know | warn | #224 (the classification half) |
-| MD-L04 | `~/.claude` missing, not a symlink, or resolving outside the managed profiles dir while managed accounts exist; same for `~/.codex` vs `~/.codex-profiles` | error | #62, #66, onboarding runbook |
+| MD-L04 | `~/.claude` missing, not a symlink, or resolving outside the managed profiles dir while managed accounts exist; same for `~/.codex` vs `<DATA_DIR>/codex-profiles` (or its override), including a stale legacy target after migration | error | #62, #66, #647, onboarding runbook |
 | MD-L05 | Shell pinning absent or stale: no generated block in `~/.zshenv`, or `claude-env.sh` pinning a profile that is not the active one, or the pinned pair `CLAUDE_CONFIG_DIR` / `CLAUDE_SECURESTORAGE_CONFIG_DIR` diverging (the CLAUDE_IDENTITY.md invariant: divergence stores transcripts under one profile while authenticating as another) | error | #66, docs/CLAUDE_IDENTITY.md |
 | MD-L06 | No Codex pinning while multiple Codex homes exist (a plain `codex login` then lands wherever `~/.codex` points, destroying another profile's single-use refresh token) | warn | #161 |
 | MD-L07 | Duplicate identity: two Codex homes whose `auth.json` carry the same `tokens.account_id`, or the daemon's duplicate-token fingerprint (shared weekly reset instant) flagging two Claude profiles | error | #108, #161, docs/CLAUDE_IDENTITY.md |

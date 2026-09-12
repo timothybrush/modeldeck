@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-target="${HOME}/.zshenv"
+target="${MODELDECK_ZSHENV_PATH:-${HOME}/.zshenv}"
+script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd -P)
 begin='# >>> ModelDeck Claude identity switching >>>'
 end='# <<< ModelDeck Claude identity switching <<<'
 codex_begin='# >>> ModelDeck Codex identity switching >>>'
@@ -36,18 +37,64 @@ remove_block() {
   mv "$temporary" "$target"
 }
 
-if [ "${1:-}" = '--remove' ]; then
-  remove_block "$begin" "$end"
-  remove_block "$codex_begin" "$codex_end"
-  exit 0
-fi
-
-if [ "${1:-}" != '' ]; then
+if [ "${1:-}" != '' ] && [ "${1:-}" != '--remove' ]; then
   echo 'usage: scripts/install-shell-env.sh [--remove]' >&2
   exit 2
 fi
 
-if ! { [ -f "$target" ] && grep -Fq 'ModelDeck/claude-env.sh' "$target"; }; then
+# An explicit setting wins. Before the first decision, only an existing
+# ModelDeck-owned symlink proves this is an older managed installation.
+provider_managed() {
+  provider="$1"
+  active_link="$2"
+  profiles_dir="$3"
+  data_dir="${MODELDECK_DATA_DIR:-$HOME/Library/Application Support/ModelDeck}"
+  database="${MODELDECK_DB_PATH:-$data_dir/modeldeck.sqlite}"
+  if [ -e "$database" ]; then
+    # Reuse the daemon's read-only WAL snapshot; SQLite's ordinary read-only
+    # open can still create shared-memory sidecars before refusing a request.
+    decision=$(node --input-type=module - "$database" "$provider" "$script_dir/../src/db.mjs" <<'JS'
+import { pathToFileURL } from 'node:url';
+const { Store } = await import(pathToFileURL(process.argv[4]));
+const store = new Store(process.argv[2], { readOnly: true });
+try {
+  const value = store.getSettings()[`${process.argv[3]}Managed`];
+  process.stdout.write(value === true ? '1' : value === false ? '0' : '');
+} finally { store.close(); }
+JS
+    ) || return 1
+    case "$decision" in
+      1) return 0 ;;
+      '') ;;
+      *) return 1 ;;
+    esac
+  fi
+  [ -L "$active_link" ] && [ -d "$profiles_dir" ] || return 1
+  resolved=$(CDPATH='' cd -P "$active_link" && pwd -P) || return 1
+  root=$(CDPATH='' cd -P "$profiles_dir" && pwd -P) || return 1
+  case "$resolved" in "$root"/*) return 0 ;; *) return 1 ;; esac
+}
+
+claude_managed=false
+codex_managed=false
+provider_managed claude "${MODELDECK_CLAUDE_ACTIVE_LINK:-$HOME/.claude}" "${MODELDECK_CLAUDE_PROFILES_DIR:-${MODELDECK_DATA_DIR:-$HOME/Library/Application Support/ModelDeck}/claude-profiles}" && claude_managed=true
+provider_managed codex "${MODELDECK_CODEX_ACTIVE_LINK:-$HOME/.codex}" "${MODELDECK_CODEX_PROFILES_DIR:-$HOME/.codex-profiles}" && codex_managed=true
+if [ "$claude_managed" = false ] && [ "$codex_managed" = false ]; then
+  echo 'not-managed (409): ModelDeck does not manage these home folders. Turn on Manage account switching in Settings first.' >&2
+  exit 1
+fi
+if [ -L "$target" ]; then
+  echo 'The shell configuration must be a real file.' >&2
+  exit 1
+fi
+
+if [ "${1:-}" = '--remove' ]; then
+  if [ "$claude_managed" = true ]; then remove_block "$begin" "$end"; fi
+  if [ "$codex_managed" = true ]; then remove_block "$codex_begin" "$codex_end"; fi
+  exit 0
+fi
+
+if [ "$claude_managed" = true ] && ! { [ -f "$target" ] && grep -Fq 'ModelDeck/claude-env.sh' "$target"; }; then
   # Replace any earlier (readlink-based) ModelDeck block with the current one.
   remove_block "$begin" "$end"
 
@@ -68,7 +115,7 @@ if ! { [ -f "$target" ] && grep -Fq 'ModelDeck/claude-env.sh' "$target"; }; then
   } >> "$target"
 fi
 
-if ! { [ -f "$target" ] && grep -Fq "$codex_begin" "$target"; }; then
+if [ "$codex_managed" = true ] && ! { [ -f "$target" ] && grep -Fq "$codex_begin" "$target"; }; then
   {
     printf '\n%s\n' "$codex_begin"
     # Respect an explicit CODEX_HOME (per-profile launch commands, #106).

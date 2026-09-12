@@ -6,6 +6,32 @@ const ALLOWED_ENV = Object.freeze([
   'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
 ]);
 
+// The legacy-home adoption rename, also used in reverse when switching is disabled.
+// Never copy credentials, follow a source symlink, or replace an existing destination.
+export async function moveLegacyHome(source, destination) {
+  const stat = await fs.promises.lstat(source);
+  if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid())) {
+    throw new Error('The provider home must be a real directory owned by you.');
+  }
+  try {
+    await fs.promises.lstat(destination);
+    throw new Error(`The destination already exists: ${destination}`);
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  await fs.promises.rename(source, destination);
+}
+
+export async function validateUnmanagedHome(profileRef, home) {
+  const stat = await fs.promises.lstat(home);
+  if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid())
+      // Vendor-created homes may be 0755; a home another local user can write
+      // to could have its credential files swapped before a probe reads them.
+      || (stat.mode & 0o022) !== 0
+      || await fs.promises.realpath(profileRef) !== await fs.promises.realpath(home)) {
+    throw new Error('The provider home must be a real directory owned by you.');
+  }
+  return home;
+}
+
 /// Activation clobber-guard refusal, shared by the service and the Claude
 /// adapter so the message + machine-readable code can never drift (#55).
 export function activeLinkBlockedError(provider, activeLink) {
@@ -14,6 +40,14 @@ export function activeLinkBlockedError(provider, activeLink) {
   );
   error.code = 'active-link-blocked';
   return error;
+}
+
+export function safeProfileName(value, invalidProfileNameError = 'invalid profile name') {
+  const name = String(value || '').trim().toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^[._-]+|[._-]+$/g, '');
+  if (!name || name === '.' || name === '..') throw new Error(invalidProfileNameError);
+  return name;
 }
 
 export function createProviderProfileHelpers({
@@ -35,25 +69,13 @@ export function createProviderProfileHelpers({
     return env;
   }
 
-  function safeProfileName(value) {
-    const name = String(value || '').trim().toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/^[._-]+|[._-]+$/g, '');
-    if (!name || name === '.' || name === '..') throw new Error(invalidProfileNameError);
-    return name;
-  }
-
-  // The directory name is an internal identifier derived from the label —
-  // the account's display label lives in the store, not on disk. A leftover
-  // directory (an interrupted earlier add, an account deleted from the
-  // roster, a reinstall) must never dead-end account creation, so a taken
-  // name falls through to the next free suffixed one. Each mkdir stays
-  // exclusive: two accounts can never share a profile home.
+  // The service resolves orphan adoption before calling this creator.
+  // Fresh profiles use an exclusive mkdir and the next free suffix.
   const MAX_PROFILE_NAME_ATTEMPTS = 50;
 
   async function createProfileHome({ profilesDir, profileName } = {}) {
     if (!profilesDir) throw new Error(profilesDirRequiredError);
-    const name = safeProfileName(profileName);
+    const name = safeProfileName(profileName, invalidProfileNameError);
     await fs.promises.mkdir(profilesDir, { recursive: true, mode: 0o700 });
     await fs.promises.chmod(profilesDir, 0o700);
     const root = await fs.promises.realpath(profilesDir);
@@ -100,7 +122,7 @@ export function createProviderProfileHelpers({
     assertOwnerOnlyDirectory,
     createProfileHome,
     profileEnv,
-    safeProfileName,
+    safeProfileName: (value) => safeProfileName(value, invalidProfileNameError),
     validateProfileHome,
   };
 }

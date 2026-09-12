@@ -233,6 +233,8 @@ test('the auth-files reader takes the non-secret allowlist and NOTHING else', ()
         email: '  Mixed.Case@Example.Invalid ',
         status: 'ERROR',
         status_message: 'unauthorized',
+        next_retry_after: ' 2030-01-01T21:50:00-08:00 ',
+        expired: ' 2030-01-02T08:00:00Z ',
         unavailable: true,
         disabled: false,
         // Both of these must be ignored: `account` is the API KEY for an
@@ -258,11 +260,15 @@ test('the auth-files reader takes the non-secret allowlist and NOTHING else', ()
     codexAccountId: null,
     status: 'error',
     statusMessage: 'unauthorized',
+    nextRetryAfter: '2030-01-01T21:50:00-08:00',
+    expired: '2030-01-02T08:00:00Z',
     disabled: false,
     unavailable: true,
   });
   assert.equal(entries[1].codexAccountId, 'acct-9');
   assert.equal(entries[1].provider, 'codex');
+  assert.equal(entries[1].nextRetryAfter, '');
+  assert.equal(entries[1].expired, '');
   const serialized = JSON.stringify(entries);
   assert.ok(!serialized.includes('sk-super-secret-key'));
   assert.ok(!serialized.includes('must-not-be-read'));
@@ -270,7 +276,7 @@ test('the auth-files reader takes the non-secret allowlist and NOTHING else', ()
   assert.throws(() => assertProxyAuthFilesShape('[]'), /must be a JSON object/);
 });
 
-test('credential health names the three states and lets a healthy sibling win', () => {
+test('credential health keeps disabled separate and lets a healthy sibling win', () => {
   assert.equal(proxyCredentialHealthOf({ status: 'active', disabled: false, unavailable: false }), 'ok');
   assert.equal(proxyCredentialHealthOf({ status: 'refreshing', disabled: false, unavailable: false }), 'ok');
   // Benched is not broken: a re-login would not un-bench it.
@@ -291,6 +297,81 @@ test('credential health names the three states and lets a healthy sibling win', 
   assert.deepEqual(health.byClaudeEmail.get('b@x.invalid'), { health: 'error', detail: 'unauthorized' });
   assert.deepEqual(health.byCodexAccountId.get('acct-1'), { health: 'ok', detail: null });
   assert.equal(health.byCodexAccountId.size, 1);
+});
+
+const HEALTH_NOW = Date.parse('2030-01-02T05:00:00Z');
+const RATE_LIMITED_AUTH_FILE = {
+  provider: 'claude', email: CLAUDE_EMAIL,
+  unavailable: true, status: 'error', status_message: '',
+  next_retry_after: '2030-01-01T21:50:00-08:00',
+};
+
+test('TRIPWIRE proxy-rate-limit-resting — a future retry is resting and carries its ISO reset time', () => {
+  const entries = assertProxyAuthFilesShape({ files: [RATE_LIMITED_AUTH_FILE] });
+  assert.equal(proxyCredentialHealthOf(entries[0], HEALTH_NOW), 'resting');
+  const health = proxyCredentialHealthFromAuthFiles(entries, HEALTH_NOW);
+  assert.deepEqual(health.byClaudeEmail.get(CLAUDE_EMAIL), {
+    health: 'resting', detail: '2030-01-02T05:50:00.000Z',
+  });
+  for (const overrides of [
+    { status: 'active' },
+    { unavailable: false },
+    { status_message: 'rate limit exceeded' },
+    { expired: '2030-01-02T08:00:00Z' },
+  ]) {
+    const [entry] = assertProxyAuthFilesShape({ files: [{ ...RATE_LIMITED_AUTH_FILE, ...overrides }] });
+    assert.equal(proxyCredentialHealthOf(entry, HEALTH_NOW), 'resting');
+  }
+});
+
+test('TRIPWIRE proxy-rate-limit-past-retry — an elapsed, missing, or invalid retry remains error', () => {
+  for (const retry of ['2030-01-02T04:59:59Z', '2030-01-02T05:00:00Z', '', undefined, 'not-a-date', 123]) {
+    const [entry] = assertProxyAuthFilesShape({
+      files: [{ ...RATE_LIMITED_AUTH_FILE, next_retry_after: retry }],
+    });
+    assert.equal(proxyCredentialHealthOf(entry, HEALTH_NOW), 'error', String(retry));
+  }
+});
+
+test('TRIPWIRE proxy-rate-limit-bad-token — unauthorized or expired credentials stay error despite a future retry', () => {
+  for (const status_message of [
+    'unauthorized', 'Unauthorized', 'invalid_grant', 'invalid_token',
+    'OAuth token has been revoked.', 'token_invalidated', 'token expired',
+    'invalid bearer token', 'bad token', 'authentication_error',
+  ]) {
+    const entries = assertProxyAuthFilesShape({ files: [{ ...RATE_LIMITED_AUTH_FILE, status_message }] });
+    assert.equal(proxyCredentialHealthOf(entries[0], HEALTH_NOW), 'error', status_message);
+    assert.deepEqual(proxyCredentialHealthFromAuthFiles(entries, HEALTH_NOW).byClaudeEmail.get(CLAUDE_EMAIL), {
+      health: 'error', detail: status_message,
+    });
+  }
+  for (const status of ['active', 'error']) {
+    const [entry] = assertProxyAuthFilesShape({ files: [{
+      ...RATE_LIMITED_AUTH_FILE, status, unavailable: false, expired: '2030-01-02T04:59:59Z',
+    }] });
+    assert.equal(proxyCredentialHealthOf(entry, HEALTH_NOW), 'error');
+  }
+});
+
+test('resting preserves healthy-wins for both providers and never replaces a disabled or active verdict', () => {
+  for (const identity of [
+    { provider: 'claude', email: CLAUDE_EMAIL },
+    { provider: 'codex', id_token: { chatgpt_account_id: CODEX_ACCOUNT_ID } },
+  ]) {
+    const resting = { ...RATE_LIMITED_AUTH_FILE, ...identity };
+    const healthy = { ...resting, status: 'active', unavailable: false };
+    for (const files of [[resting, healthy], [healthy, resting]]) {
+      const entries = assertProxyAuthFilesShape({ files });
+      const health = proxyCredentialHealthFromAuthFiles(entries, HEALTH_NOW);
+      const record = identity.provider === 'claude'
+        ? health.byClaudeEmail.get(CLAUDE_EMAIL) : health.byCodexAccountId.get(CODEX_ACCOUNT_ID);
+      assert.deepEqual(record, { health: 'ok', detail: null });
+    }
+  }
+  for (const overrides of [{ disabled: true }, { status: 'disabled' }]) {
+    const [entry] = assertProxyAuthFilesShape({ files: [{ ...RATE_LIMITED_AUTH_FILE, ...overrides }] });
+    assert.equal(proxyCredentialHealthOf(entry, HEALTH_NOW), 'disabled');
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -536,6 +617,41 @@ test('a re-login runs start → wait → success, and the success is visible as 
   const [after] = (await data.service.accountsWithAuthState()).filter((a) => a.id === data.claude.id);
   assert.equal(after.proxyCredential, 'ok');
   assert.equal(after.proxyCredentialDetail, undefined);
+});
+
+test('TRIPWIRE proxy-rate-limit-account-payload — both providers carry resting and the reset time unchanged', async (t) => {
+  const proxy = stubProxy({ authFiles: [
+    RATE_LIMITED_AUTH_FILE,
+    { ...RATE_LIMITED_AUTH_FILE, provider: 'codex', id_token: { chatgpt_account_id: CODEX_ACCOUNT_ID } },
+  ] });
+  const data = await fixture(t, { proxyReloginFetch: proxy, proxyReloginNow: () => HEALTH_NOW });
+  const accounts = await data.service.accountsWithAuthState();
+  for (const id of [data.claude.id, data.codex.id]) {
+    const account = accounts.find((entry) => entry.id === id);
+    assert.equal(account.proxyPool, 'member');
+    assert.equal(account.proxyCredential, 'resting');
+    assert.equal(account.proxyCredentialDetail, '2030-01-02T05:50:00.000Z');
+  }
+});
+
+test('TRIPWIRE proxy-rate-limit-reset-is-not-sign-in — automatic recovery never records a credential repair', async (t) => {
+  let now = HEALTH_NOW;
+  const proxy = stubProxy({ authFiles: [RATE_LIMITED_AUTH_FILE] });
+  const data = await fixture(t, { proxyReloginFetch: proxy, proxyReloginNow: () => now });
+  for (const priorError of [false, true]) {
+    if (priorError) {
+      proxy.state.authFiles = [{ ...RATE_LIMITED_AUTH_FILE, status_message: 'unauthorized' }];
+      await data.service.proxyCredentialHealth({ force: true });
+    }
+    now += 1_000;
+    proxy.state.authFiles = [RATE_LIMITED_AUTH_FILE];
+    await data.service.proxyCredentialHealth({ force: true });
+    now += 1_000;
+    proxy.state.authFiles = [{ ...RATE_LIMITED_AUTH_FILE, status: 'active', unavailable: false }];
+    await data.service.proxyCredentialHealth({ force: true });
+    assert.equal(data.service.proxyCredentialRepairedAt(data.claude), null,
+      'ending a rate-limit rest must not claim somebody signed in');
+  }
 });
 
 test('a Codex member is repaired through the codex login route', async (t) => {

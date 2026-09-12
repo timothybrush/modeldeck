@@ -17,6 +17,14 @@ import Testing
 // with their reason; add to that list only with the same kind of reason.
 
 private let allowedLiterals: [String: String] = [
+    // Issue #648's amended ruling explicitly names the provider's account
+    // switching control and supplies this consent wording.
+    "Manage account switching for ": "Tim's required setting label in issue 648",
+    "Switching between accounts needs ModelDeck to manage ~/.": "Tim's required consent title in issue 648",
+    "Apps that read this folder directly will follow the active account. Running sessions are never touched.":
+        "Tim's required account-switching disclosure in issue 648",
+    "Turning off account switching for Claude is not available yet. Your accounts and history are unchanged.":
+        "Tim's required Claude refusal in issue 648",
     // The provider's own flow is what the user must run; /login signs in an
     // identity at the provider, not a ModelDeck deck member.
     "different identity than . Log out and run /login as that account.":

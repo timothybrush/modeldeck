@@ -294,11 +294,13 @@ struct Issue539SoftRepairedBannerTests {
         let source = try viewSource("Sources/ModelDeckMac/DeckPopoverView.swift")
         // One line, restyled — not a second row and not a second banner.
         #expect(source.contains("let repaired = alert.isRepairedPending"))
-        #expect(source.contains(#"let visible = repaired ? alert.repairedStatusLine : "\(alert.statusLine)\(httpStatus)""#))
-        #expect(source.contains("foregroundStyle(repaired ? Color.secondary : Color.red)"))
+        #expect(source.contains(#"?? (repaired ? alert.repairedStatusLine : "\(alert.statusLine)\(httpStatus)")"#))
+        // Issue #572 widened the quiet gate: resting OR repaired OR transient, one line.
+        #expect(source.contains("let quiet = restingText != nil || repaired || alert.isTransient"))
+        #expect(source.contains("foregroundStyle(quiet ? Color.secondary : Color.red)"))
         #expect(source.contains(".lineLimit(1)"))
-        // The action disappears in the soft state; a running sign-in does not.
-        #expect(source.contains("if !repaired || relogin?.display.isRunning == true {"))
+        // The action disappears in the quiet states; a running sign-in does not.
+        #expect(source.contains("if !quiet || relogin?.display.isRunning == true {"))
         // VoiceOver and the tooltip keep the whole story.
         #expect(source.contains("alert.repairedDetail"))
         #expect(source.contains("Pool alert. \\(message)"))

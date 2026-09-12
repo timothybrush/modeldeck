@@ -271,7 +271,7 @@ struct MenuBarHealthRendererTests {
 @MainActor
 struct HealthChipReconcileTests {
     private func model() -> DeckPopoverModel {
-        let defaults = UserDefaults(suiteName: "health-chip-tests-\(UUID().uuidString)")!
+        let defaults = ScratchDefaults.make("health-chip-tests")
         return DeckPopoverModel(defaults: defaults)
     }
 

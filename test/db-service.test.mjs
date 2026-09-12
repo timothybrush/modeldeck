@@ -23,6 +23,7 @@ function fixture() {
   fs.chmodSync(claudePersonalHome, 0o700);
   fs.chmodSync(codexHome, 0o700);
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const claudeBusiness = store.saveAccount({ provider: 'claude', label: 'Business Claude', identity: 'business@example.invalid', profileRef: claudeBusinessHome, purpose: 'LoanMeld', isDefault: true });
   const claudePersonal = store.saveAccount({ provider: 'claude', label: 'Personal Claude', profileRef: claudePersonalHome });
   const codexBusiness = store.saveAccount({ provider: 'codex', label: 'Business Codex', profileRef: codexHome, isDefault: true });
@@ -361,6 +362,7 @@ test('migrates a pre-identity account database without data loss', () => {
   legacy.prepare('INSERT INTO accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run('legacy', 'claude', 'Legacy Max', 'Business', 'legacy-profile', '#fff', 1, 1, '{}', '2026-01-01', '2026-01-01');
   legacy.close();
   const store = new Store(dbPath);
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getAccount('legacy').label, 'Legacy Max');
     assert.equal(store.getAccount('legacy').identity, '');
@@ -389,6 +391,7 @@ test('settings persist across Store instances and partial updates retain default
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-settings-'));
   const dbPath = path.join(root, 'modeldeck.sqlite');
   let store = new Store(dbPath);
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getSettings().autoRefreshEnabled, true);
     const updated = store.saveSettings({ layout: 'single-column', notificationThresholdPercent: 42 });
@@ -412,6 +415,7 @@ test('TRIPWIRE: usage analytics defaults on and preserves a stored off value', (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-analytics-default-'));
   const dbPath = path.join(root, 'modeldeck.sqlite');
   let store = new Store(dbPath);
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getSettings().usageAnalyticsEnabled, true);
     store.saveSettings({ usageAnalyticsEnabled: false });
@@ -430,6 +434,7 @@ test('TRIPWIRE: usage analytics defaults on and preserves a stored off value', (
 
 test('settings reject inherited object names as unknown keys', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.throws(() => store.saveSettings({ constructor: 'unexpected' }), /unknown setting: constructor/);
   } finally { store.close(); }
@@ -437,6 +442,7 @@ test('settings reject inherited object names as unknown keys', () => {
 
 test('menuBarAccountId accepts short strings and rejects everything else', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getSettings().menuBarAccountId, '');
     assert.equal(store.saveSettings({ menuBarAccountId: 'acc-1' }).menuBarAccountId, 'acc-1');
@@ -453,6 +459,7 @@ test('menuBarAccountId accepts short strings and rejects everything else', () =>
 // other's values.
 test('menuBarShowWhen accepts short strings and rejects everything else', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getSettings().menuBarShowWhen, '');
     assert.equal(store.saveSettings({ menuBarShowWhen: 'yellow' }).menuBarShowWhen, 'yellow');
@@ -470,6 +477,7 @@ test('menuBarShowWhen accepts short strings and rejects everything else', () => 
 // round-trip each other's values.
 test('poolTotalFormat accepts short strings and rejects everything else', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getSettings().poolTotalFormat, '');
     assert.equal(store.saveSettings({ poolTotalFormat: 'claude:share' }).poolTotalFormat, 'claude:share');
@@ -486,6 +494,7 @@ test('poolTotalFormat accepts short strings and rejects everything else', () => 
 // time instead of silently never scanning.
 test('extraClaudeScanRoots accepts labeled absolute paths and rejects everything else', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.deepEqual(store.getSettings().extraClaudeScanRoots, []);
     const entry = { path: '/placeholder/claude-home', profileSlug: 'profile-placeholder' };
@@ -526,6 +535,7 @@ test('extraClaudeScanRoots accepts labeled absolute paths and rejects everything
 // other's values.
 test('deckHealthLabels accepts short strings and rejects everything else', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getSettings().deckHealthLabels, '');
     assert.equal(store.saveSettings({ deckHealthLabels: 'show' }).deckHealthLabels, 'show');

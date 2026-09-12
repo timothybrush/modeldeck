@@ -9,6 +9,8 @@ import Foundation
 /// missing keys fall back to the same defaults the daemon uses, and unknown
 /// keys are ignored, so client and daemon can grow independently.
 public struct DaemonSettings: Codable, Equatable, Sendable {
+    public var claudeManaged: Bool?
+    public var codexManaged: Bool?
     public var autoRefreshEnabled: Bool
     public var autoRefreshIntervalSeconds: Int
     /// Issue #90 change-event provenance: true once the user has ever
@@ -120,8 +122,12 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         autoRenewEnabled: Bool = true,
         otelReceiverEnabled: Bool = false,
         sharedUserScopeEnabled: Bool = false,
-        usageAnalyticsEnabled: Bool = true
+        usageAnalyticsEnabled: Bool = true,
+        claudeManaged: Bool? = nil,
+        codexManaged: Bool? = nil
     ) {
+        self.claudeManaged = claudeManaged
+        self.codexManaged = codexManaged
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
         self.autoRefreshIntervalCustomized = autoRefreshIntervalCustomized
@@ -142,6 +148,8 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        claudeManaged = try container.decodeIfPresent(Bool.self, forKey: .claudeManaged)
+        codexManaged = try container.decodeIfPresent(Bool.self, forKey: .codexManaged)
         let defaults = Self.defaults
         autoRefreshEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoRefreshEnabled)
             ?? defaults.autoRefreshEnabled
@@ -261,6 +269,8 @@ public enum DeckHealthLabels: Equatable, Sendable {
 /// matching the daemon's merge semantics — untouched keys (including ones this
 /// app doesn't surface) are never clobbered.
 public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
+    public var claudeManaged: Bool?
+    public var codexManaged: Bool?
     public var autoRefreshEnabled: Bool?
     public var autoRefreshIntervalSeconds: Int?
     /// Issue #90: sent as `true` alongside an explicit interval-picker
@@ -314,8 +324,12 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         poolTotalFormat: String? = nil,
         deckHealthLabels: String? = nil,
         autoRenewEnabled: Bool? = nil,
-        usageAnalyticsEnabled: Bool? = nil
+        usageAnalyticsEnabled: Bool? = nil,
+        claudeManaged: Bool? = nil,
+        codexManaged: Bool? = nil
     ) {
+        self.claudeManaged = claudeManaged
+        self.codexManaged = codexManaged
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
         self.autoRefreshIntervalCustomized = autoRefreshIntervalCustomized
@@ -349,12 +363,16 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             poolTotalFormat: other.poolTotalFormat ?? poolTotalFormat,
             deckHealthLabels: other.deckHealthLabels ?? deckHealthLabels,
             autoRenewEnabled: other.autoRenewEnabled ?? autoRenewEnabled,
-            usageAnalyticsEnabled: other.usageAnalyticsEnabled ?? usageAnalyticsEnabled
+            usageAnalyticsEnabled: other.usageAnalyticsEnabled ?? usageAnalyticsEnabled,
+            claudeManaged: other.claudeManaged ?? claudeManaged,
+            codexManaged: other.codexManaged ?? codexManaged
         )
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(claudeManaged, forKey: .claudeManaged)
+        try container.encodeIfPresent(codexManaged, forKey: .codexManaged)
         try container.encodeIfPresent(autoRefreshEnabled, forKey: .autoRefreshEnabled)
         try container.encodeIfPresent(autoRefreshIntervalSeconds, forKey: .autoRefreshIntervalSeconds)
         try container.encodeIfPresent(autoRefreshIntervalCustomized, forKey: .autoRefreshIntervalCustomized)
@@ -372,13 +390,15 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     }
 
     enum CodingKeys: String, CodingKey {
+        case claudeManaged, codexManaged
         case autoRefreshEnabled, autoRefreshIntervalSeconds, autoRefreshIntervalCustomized, pauseWhileActive
         case layout, defaultSort, notificationThresholdPercent, menuBarStyle, menuBarAccountId
         case menuBarShowWhen, poolTotalFormat, deckHealthLabels, autoRenewEnabled, usageAnalyticsEnabled
     }
 
     public var isEmpty: Bool {
-        autoRefreshEnabled == nil && autoRefreshIntervalSeconds == nil
+        claudeManaged == nil && codexManaged == nil
+            && autoRefreshEnabled == nil && autoRefreshIntervalSeconds == nil
             && autoRefreshIntervalCustomized == nil && pauseWhileActive == nil
             && layout == nil && defaultSort == nil && notificationThresholdPercent == nil
             && menuBarStyle == nil && menuBarAccountId == nil

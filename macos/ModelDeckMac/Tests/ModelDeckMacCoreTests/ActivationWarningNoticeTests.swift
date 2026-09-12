@@ -102,10 +102,7 @@ private struct FixedStateProvider: DeckStateProviding {
 @MainActor
 struct PostActivationWarningsModelTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "activation-warning-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("activation-warning-tests")
     }
 
     private func model(

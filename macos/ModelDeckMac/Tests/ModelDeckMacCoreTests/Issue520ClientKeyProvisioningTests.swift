@@ -376,9 +376,7 @@ struct Issue520ReportTests {
 
     @Test("report replay — a restarted app never reissues a generation the daemon applied")
     func generationSurvivesRestart() async throws {
-        let suiteName = "modeldeck.tests.clientkeys.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let defaults = ScratchDefaults.make("clientkeys")
         let key = "modeldeck.tests.clientKeyGeneration"
 
         let first = UserDefaultsClientKeyGenerationStore(defaults: defaults, key: key)

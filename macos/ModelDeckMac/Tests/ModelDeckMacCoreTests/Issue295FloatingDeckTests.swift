@@ -12,10 +12,7 @@ import Testing
 @MainActor
 struct FloatingDeckModelTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "floating-deck-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("floating-deck-tests")
     }
 
     @Test func startsAttachedAndDetachFiresTheOpenHook() {

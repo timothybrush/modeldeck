@@ -232,7 +232,7 @@ struct DeckHealthChipDisplayTests {
         // The published mirror the chip reads starts false — a deck that
         // renders before the first settings apply shows dot-only, matching
         // the daemon default.
-        let defaults = UserDefaults(suiteName: "issue242-\(UUID().uuidString)") ?? .standard
+        let defaults = ScratchDefaults.make("issue242")
         let model = DeckPopoverModel(defaults: defaults)
         #expect(!model.showsHealthVerdictLabels)
     }

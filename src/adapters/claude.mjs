@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { extractIdentity } from './identity.mjs';
 import { claudeCredentialsPresent } from './claude-keychain.mjs';
-import { createProviderProfileHelpers, activeLinkBlockedError } from './provider-profile.mjs';
+import { validateUnmanagedHome, createProviderProfileHelpers, activeLinkBlockedError } from './provider-profile.mjs';
 import { LEGACY_CLIENT_KEY_SERVICE, assertClientKeyService } from '../client-key-helper.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -413,6 +413,7 @@ export const HELPER_MISSING_ERROR = "Claude usage refresh failed: ModelDeck's ba
 export async function fetchClaudeUsage({
   claudeConfigDir,
   profilesDir,
+  unmanagedHome,
   timeoutMs = 20_000,
   run = execFileAsync,
   lstat = fs.promises.lstat,
@@ -421,6 +422,7 @@ export async function fetchClaudeUsage({
 } = {}) {
   if (!claudeConfigDir) throw new Error('CLAUDE_CONFIG_DIR is required');
   if (profilesDir) await validateClaudeProfileHome({ profileRef: claudeConfigDir, profilesDir });
+  else if (unmanagedHome) await validateUnmanagedHome(claudeConfigDir, unmanagedHome);
   else await assertOwnerOnlyDirectory(claudeConfigDir, 'Claude profile home');
   const credentialsPath = path.join(claudeConfigDir, '.credentials.json');
   let credentialStat = null;
@@ -714,6 +716,7 @@ export async function readClaudeAuthStatus({
   claudePath = 'claude',
   claudeConfigDir,
   profilesDir,
+  unmanagedHome,
   timeoutMs = 20_000,
   run = execFileAsync,
   lstat = fs.promises.lstat,
@@ -725,6 +728,7 @@ export async function readClaudeAuthStatus({
 } = {}) {
   if (!claudeConfigDir) throw new Error('CLAUDE_CONFIG_DIR is required');
   if (profilesDir) await validateClaudeProfileHome({ profileRef: claudeConfigDir, profilesDir });
+  else if (unmanagedHome) await validateUnmanagedHome(claudeConfigDir, unmanagedHome);
   else await assertOwnerOnlyDirectory(claudeConfigDir, 'Claude profile home');
 
   const username = userInfo().username;

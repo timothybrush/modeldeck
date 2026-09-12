@@ -3,7 +3,8 @@
 #
 # Boots the agent out of the GUI login session and removes the plist.
 # Idempotent: safe to run when the agent is not loaded or not installed.
-# Never touches the database, logs, or Keychain entries.
+# Leaves data (including managed Codex profiles and recovery backups) and
+# Keychain entries in place. README Uninstall covers optional data removal.
 #
 # Usage: scripts/uninstall-launch-agent.sh
 set -euo pipefail
@@ -21,4 +22,5 @@ else
   echo "No plist at $PLIST"
 fi
 
-echo "Database, logs, and Keychain token were left in place."
+echo "Data (including managed Codex profiles and recovery backups) and the Keychain token were left in place."
+echo "Deleting the ModelDeck data directory also removes those Codex profiles; see README Uninstall before deleting data."

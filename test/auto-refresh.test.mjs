@@ -65,6 +65,7 @@ function fixture({
   demoFixtures = false,
 } = {}) {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   store.saveSettings({
     autoRefreshEnabled: enabled,
     autoRefreshIntervalSeconds: intervalSeconds,
@@ -88,6 +89,7 @@ test('TRIPWIRE api-shutdown-drains-startup-writers — shutdown waits for startu
   const profileRef = path.join(profilesDir, 'work');
   fs.mkdirSync(profileRef, { recursive: true, mode: 0o700 });
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   store.saveSettings({ autoRefreshEnabled: false });
   store.saveAccount({ provider: 'claude', label: 'Work', profileRef });
   const service = new ModelDeckService(store, {
@@ -289,6 +291,7 @@ test('a long sleep drops missed ticks instead of firing a catch-up burst', async
 // it, and nothing can clear it.
 test('changing the interval sets the customized flag; echoes and false cannot touch it', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getSettings().autoRefreshIntervalCustomized, false);
 
@@ -313,6 +316,7 @@ test('changing the interval sets the customized flag; echoes and false cannot to
 
 test('an explicit picker assertion sets the flag even when the value matches the default', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     // The Swift interval picker sends the value plus the flag on user
     // selection, so re-picking 5 minutes (the default) still sticks.
@@ -575,6 +579,7 @@ test('ending an active session waits for the next normal tick without a catch-up
 test('default process lister filters current-user ps output to exact provider names', async () => {
   const calls = [];
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const service = new ModelDeckService(store, {
     exec: async (...args) => {
       calls.push(args);

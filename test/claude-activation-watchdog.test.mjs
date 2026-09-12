@@ -57,6 +57,7 @@ test('TRIPWIRE #484: a never-settling activation cannot wedge the Claude activat
   fs.chmodSync(profilesDir, 0o700);
 
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => {
     store.close();
     fs.rmSync(root, { recursive: true, force: true });
@@ -148,6 +149,7 @@ test('TRIPWIRE #484: a never-settling activation cannot wedge the Claude activat
 test('TRIPWIRE #484: a never-settling settings operation cannot strand the Claude activation safety fence', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-settings-watchdog-'));
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => {
     store.close();
     fs.rmSync(root, { recursive: true, force: true });
@@ -212,6 +214,7 @@ test('TRIPWIRE #484: a timed-out settings write stays fenced until its late oper
   fs.writeFileSync(settingsPath, 'initial settings');
 
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => {
     store.close();
     fs.rmSync(root, { recursive: true, force: true });

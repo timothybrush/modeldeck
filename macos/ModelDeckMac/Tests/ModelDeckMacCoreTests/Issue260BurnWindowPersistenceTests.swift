@@ -42,10 +42,7 @@ private func burningState(remaining: Double, observedAt: Date) -> DeckState {
 }
 
 private func freshDefaults(_ name: String) -> UserDefaults {
-    let suite = "modeldeck-burnwindow-\(name)-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suite)!
-    defaults.removePersistentDomain(forName: suite)
-    return defaults
+    ScratchDefaults.make("modeldeck-burnwindow-\(name)")
 }
 
 @Suite("Burn window survives relaunch (issue #260)")

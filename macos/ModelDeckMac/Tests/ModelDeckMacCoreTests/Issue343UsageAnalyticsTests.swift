@@ -74,9 +74,7 @@ struct UsageAnalyticsMenuTests {
     @MainActor
     @Test func deckModelPublishesNoURLByDefault() {
         // nil = flag off = the gear menu renders no item at all.
-        let suite = "issue343-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
+        let defaults = ScratchDefaults.make("issue343-tests")
         let model = DeckPopoverModel(defaults: defaults)
         #expect(model.usageAnalyticsDashboardURL == nil)
     }

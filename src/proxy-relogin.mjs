@@ -25,10 +25,10 @@
 // recovery signal (#395's detector clears on the same fact).
 //
 // Field allowlist, deliberately narrow: `name`, `provider`/`type`, `status`,
-// `status_message`, `disabled`, `unavailable`, `email`, and the codex
-// `id_token.chatgpt_account_id`. Nothing else is read. In particular the
-// response's `account` field is NEVER read — for an api-key auth entry
-// upstream puts the API KEY there.
+// `status_message`, `next_retry_after`, `expired`, `disabled`, `unavailable`,
+// `email`, and the codex `id_token.chatgpt_account_id`. Nothing else is read.
+// In particular the response's `account` field is NEVER read — for an api-key
+// auth entry upstream puts the API KEY there.
 
 import fs from 'node:fs';
 
@@ -205,18 +205,24 @@ export function assertProxyAuthFilesShape(input) {
         statusMessage: typeof file.status_message === 'string'
           ? file.status_message.trim().slice(0, 200)
           : '',
+        nextRetryAfter: typeof file.next_retry_after === 'string' ? file.next_retry_after.trim() : '',
+        expired: typeof file.expired === 'string' ? file.expired.trim() : '',
         disabled: file.disabled === true,
         unavailable: file.unavailable === true,
       };
     });
 }
 
-/// One auth entry's health, in ModelDeck's three words.
+/// One auth entry's health, including a temporary rate-limit rest (#634).
 /// `disabled` is deliberately separate from `error`: a benched credential is
 /// not a broken one, and re-signing in would not un-bench it.
-export function proxyCredentialHealthOf(entry) {
+export function proxyCredentialHealthOf(entry, now = Date.now()) {
   if (entry.disabled || entry.status === 'disabled') return 'disabled';
-  if (entry.unavailable || entry.status === 'error') return 'error';
+  const badToken = /unauthorized|authentication[_ -]error|invalid[_ -]grant|(?:token|credential).*(?:bad|invalid|expired|revoked)|(?:bad|invalid|expired|revoked).*(?:token|credential)/i.test(entry.statusMessage || '');
+  if (badToken || Date.parse(entry.expired) <= now) return 'error';
+  if (entry.unavailable || entry.status === 'error') {
+    return Date.parse(entry.nextRetryAfter) > now ? 'resting' : 'error';
+  }
   if (entry.status === 'active' || entry.status === 'refreshing' || entry.status === 'pending') return 'ok';
   return null;
 }
@@ -230,7 +236,7 @@ export function proxyCredentialHealthOf(entry) {
 /// rule, and for the same reason: both refuse to overstate the problem. If any
 /// live file for this identity still serves traffic, the account is not the
 /// one to send the user to a browser for.
-export function proxyCredentialHealthFromAuthFiles(entries) {
+export function proxyCredentialHealthFromAuthFiles(entries, now = Date.now()) {
   const byClaudeEmail = new Map();
   const byCodexAccountId = new Map();
   const merge = (map, key, health, detail) => {
@@ -242,8 +248,10 @@ export function proxyCredentialHealthFromAuthFiles(entries) {
     map.set(key, { health, detail: detail || null });
   };
   for (const entry of entries) {
-    const health = proxyCredentialHealthOf(entry);
-    const detail = entry.statusMessage || null;
+    const health = proxyCredentialHealthOf(entry, now);
+    const detail = health === 'resting'
+      ? new Date(entry.nextRetryAfter).toISOString()
+      : entry.statusMessage || null;
     if (entry.provider === 'claude' || entry.provider === 'anthropic') {
       merge(byClaudeEmail, entry.email, health, detail);
     } else if (entry.provider === 'codex' || entry.provider === 'openai') {

@@ -85,10 +85,7 @@ private func issue330Row(
 @MainActor
 struct Issue330IndependentCriteriaTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "issue330-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("issue330-tests")
     }
 
     @Test func enablementAndPassFailTruthTableUsesStrictAND() {

@@ -336,10 +336,7 @@ struct BlockedActivateFlowTests {
         + "/placeholder/home/.codex"
 
     private func freshDefaults() -> UserDefaults {
-        let suite = "activation-flow-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("activation-flow-tests")
     }
 
     private func blockedError() -> DaemonClientError {
@@ -429,10 +426,7 @@ struct BlockedActivateFlowTests {
 @MainActor
 struct CompleteActivationTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "complete-activation-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("complete-activation-tests")
     }
 
     /// The DB-active codex row under the given activation state string.

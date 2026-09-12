@@ -54,7 +54,7 @@ public enum DaemonClientError: Error, Equatable, Sendable {
     /// machine-readable `code` (issue #55: the activation clobber-guard
     /// refusal ships `code: "active-link-blocked"` so the UI can render the
     /// daemon's guidance prominently rather than as a generic failure).
-    case daemonCodedError(message: String, code: String, status: Int)
+    case daemonCodedError(message: String, code: String, status: Int, profile: ExistingProfileSummary? = nil)
 }
 
 public extension DaemonClientError {
@@ -71,7 +71,7 @@ extension DaemonClientError: LocalizedError {
             return "The daemon returned HTTP \(code)."
         case .daemonError(let message, _):
             return message
-        case .daemonCodedError(let message, _, _):
+        case .daemonCodedError(let message, _, _, _):
             return message
         }
     }
@@ -592,14 +592,18 @@ public struct DaemonClient: Sendable {
     /// `POST /api/accounts` with no profileRef — the daemon creates the
     /// isolated owner-only profile home (step 1) and returns the new account.
     public func createAccount(_ create: AccountCreate) async throws -> DeckAccount {
-        struct Envelope: Decodable { var account: DeckAccount }
+        struct Envelope: Decodable {
+            var account: DeckAccount
+            var profileNote: String?
+        }
         var request = try await authorizedRequest(
             method: "POST",
             pathComponents: ["api", "accounts"]
         )
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(create)
-        let envelope: Envelope = try await send(request)
+        var envelope: Envelope = try await send(request)
+        envelope.account.profileNote = envelope.profileNote
         return envelope.account
     }
 
@@ -756,12 +760,13 @@ public struct DaemonClient: Sendable {
 private struct DaemonErrorBody: Decodable {
     var error: String
     var code: String?
+    var profile: ExistingProfileSummary?
 
     /// The typed error for this body: coded when the daemon attached a
     /// machine-readable code, the classic message-only error otherwise.
     func clientError(status: Int) -> DaemonClientError {
         if let code, !code.isEmpty {
-            return .daemonCodedError(message: error, code: code, status: status)
+            return .daemonCodedError(message: error, code: code, status: status, profile: profile)
         }
         return .daemonError(message: error, status: status)
     }

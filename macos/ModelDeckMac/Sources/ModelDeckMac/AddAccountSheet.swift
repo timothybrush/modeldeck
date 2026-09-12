@@ -30,9 +30,28 @@ struct AddAccountSheet: View {
             header
             switch model.step {
             case .details: detailsStep
+            case .manageProvider:
+                Text("Apps that read this folder directly will follow the active account. Running sessions are never touched.")
+                    .fixedSize(horizontal: false, vertical: true)
+            case .adoptExistingProfile(let profile): adoptExistingProfileStep(profile)
             case .adoptLegacy: adoptLegacyStep
-            case .signIn: signInStep
+            case .signIn:
+                if model.loginCommand == nil {
+                    Text("Your subscription was added, but sign-in could not start.")
+                    Button("Try sign-in again") {
+                        Task { await model.retrySignIn() }
+                    }
+                    .disabled(model.isBusy)
+                } else {
+                    signInStep
+                }
             case .confirm: confirmStep
+            }
+            if let note = model.account?.profileNote {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let error = model.lastError {
                 Text(error)
@@ -253,7 +272,9 @@ struct AddAccountSheet: View {
 
     private var signInStep: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Terminal is running \(providerDisplayName)'s login for this profile. Complete the sign-in in your browser exactly as normal, then come back here.")
+            Text(model.loginCommand == nil
+                 ? "The subscription is saved. Try starting sign-in again."
+                 : "Terminal is running \(providerDisplayName)'s login for this profile. Complete the sign-in in your browser exactly as normal, then come back here.")
                 .fixedSize(horizontal: false, vertical: true)
             if model.didActivateForLogin {
                 // Issue #99: current Claude Code stores the credential in
@@ -281,9 +302,14 @@ struct AddAccountSheet: View {
                 }
             }
             HStack {
-                Button("Open Terminal Again") { model.launchLogin() }
-                    .controlSize(.small)
+                if model.loginCommand == nil {
+                    Button("Try Sign-in Again") { Task { await model.retrySignIn() } }
+                        .disabled(model.isBusy)
+                } else {
+                    Button("Open Terminal Again") { model.launchLogin() }
+                }
             }
+            .controlSize(.small)
             Text("The browser OAuth flow belongs to the provider. ModelDeck only checks the sign-in state afterwards — it never runs a logout on any profile.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -368,6 +394,26 @@ struct AddAccountSheet: View {
 
     // MARK: Issue #586 — a real ~/.claude blocked activation; offer adoption
 
+    private func adoptExistingProfileStep(_ profile: ExistingProfileSummary) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("\(profile.transcripts) \(profile.transcripts == 1 ? "transcript" : "transcripts") · Last modified \(profileModifiedDate(profile.lastModified))")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Adopt existing keeps this folder and its history. Start fresh creates a new folder with a number added to its name and leaves the old folder where it is.")
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func profileModifiedDate(_ value: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let fractional = formatter.date(from: value)
+        formatter.formatOptions = [.withInternetDateTime]
+        guard let date = fractional ?? formatter.date(from: value) else { return "unknown" }
+        return date.formatted(date: .abbreviated, time: .shortened)
+    }
+
     private var adoptLegacyStep: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("This Mac already has a Claude setup — the ~/.claude folder. ModelDeck can use it as this subscription, so your existing sign-in and settings carry over. Usually no login is needed at all.")
@@ -427,6 +473,26 @@ struct AddAccountSheet: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(model.isBusy
                     || label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            case .manageProvider:
+                Button("Cancel") { model.reset(); dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(model.isBusy)
+                Button("Manage switching") { Task { await model.manageSwitching() } }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.isBusy)
+            case .adoptExistingProfile:
+                Button("Cancel") { model.reset(); dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(model.isBusy)
+                Button("Adopt existing") {
+                    Task { await model.resolveExistingProfile(startFresh: false) }
+                }
+                .disabled(model.isBusy)
+                Button("Start fresh") {
+                    Task { await model.resolveExistingProfile(startFresh: true) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(model.isBusy)
             case .adoptLegacy:
                 // Busy-disabled like the action buttons: a cancel-remove
                 // racing an in-flight adoption is the #590 zombie-account
@@ -446,11 +512,12 @@ struct AddAccountSheet: View {
             case .signIn:
                 Button("Cancel") { confirmingCancel = true }
                     .keyboardShortcut(.cancelAction)
+                    .disabled(model.isBusy)
                 Button("I've Signed In — Verify") {
                     Task { await model.confirmSignedIn() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.loginCommand == nil)
             case .confirm:
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
@@ -473,6 +540,8 @@ struct AddAccountSheet: View {
         // Step 1 is the same "add a subscription" for every provider — the
         // Connect verb belongs to the button and to step 2 (Tim's ruling).
         case .details: return "Add Subscription"
+        case .manageProvider: return "Switching between accounts needs ModelDeck to manage ~/.\(provider.rawValue)"
+        case .adoptExistingProfile(let profile): return "A profile named \(profile.name) already exists"
         case .adoptLegacy: return "Use your existing Claude setup?"
         case .signIn: return "Sign in to \(providerDisplayName)"
         case .confirm: return isGrokFlow ? "Grok is connected" : "Subscription added"
@@ -486,7 +555,7 @@ struct AddAccountSheet: View {
         switch model.step {
         // The adoption offer is still part of getting the subscription set
         // up, so it stays "Step 1".
-        case .details, .adoptLegacy: return 1
+        case .details, .manageProvider, .adoptExistingProfile, .adoptLegacy: return 1
         case .signIn: return 2
         case .confirm: return isGrokFlow ? 2 : 3
         }

@@ -240,7 +240,8 @@ older than the verified scoping floor, or environment setup degraded.
 ## Codex shell pinning (issue #161)
 
 Codex has the same crossed-terminal hole Claude had before #66: `~/.codex`
-is a symlink to the active profile under `~/.codex-profiles/`, and `codex`
+is a symlink to the active profile under
+`~/Library/Application Support/ModelDeck/codex-profiles/`, and `codex`
 resolves it at invocation time. A `codex login` typed in any terminal
 therefore lands in whichever profile is active at that instant — overwriting
 that profile's `auth.json` and destroying that account's only refresh token
@@ -273,7 +274,7 @@ Ceremony gotchas (the Codex mirror of the Claude rules above):
   activate B first, then open the terminal, then run `codex login`.
 - **A login in a stale terminal goes to the stale profile.** Not the one
   ModelDeck currently shows as active. If you must reuse an old terminal,
-  either prefix explicitly (`CODEX_HOME="$HOME/.codex-profiles/<name>"
+  either prefix explicitly (`CODEX_HOME="$HOME/Library/Application Support/ModelDeck/codex-profiles/<name>"
   codex login`, the #106 form) or check `printf '%s\n' "$CODEX_HOME"`
   first.
 - Sessions and shells that were already open before the block was installed

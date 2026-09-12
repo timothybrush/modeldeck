@@ -2978,7 +2978,7 @@ public final class DeckPopoverModel: ObservableObject {
     /// The daemon's verbatim guidance when activation hit the clobber guard
     /// (`code: "active-link-blocked"`), nil for every other failure.
     nonisolated static func blockedGuidance(for error: Error) -> String? {
-        guard case DaemonClientError.daemonCodedError(let message, let code, _) = error,
+        guard case DaemonClientError.daemonCodedError(let message, let code, _, _) = error,
               code == DaemonClientError.activeLinkBlockedCode
         else { return nil }
         return message
@@ -3035,7 +3035,7 @@ public final class DeckPopoverModel: ObservableObject {
         case DeckActivationError.verificationFailed:
             return "Switch not confirmed — the daemon still reports the previous subscription."
         case DaemonClientError.daemonError(let message, _),
-             DaemonClientError.daemonCodedError(let message, _, _):
+             DaemonClientError.daemonCodedError(let message, _, _, _):
             return "Couldn't activate: \(message)"
         default:
             return "Couldn't activate: \(error.localizedDescription)"

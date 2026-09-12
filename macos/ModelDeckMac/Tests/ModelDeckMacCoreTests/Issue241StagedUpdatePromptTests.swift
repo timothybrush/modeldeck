@@ -33,10 +33,7 @@ private final class PromptLog {
 }
 
 private func freshDefaults() -> UserDefaults {
-    let suite = "issue241-tests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suite)!
-    defaults.removePersistentDomain(forName: suite)
-    return defaults
+    ScratchDefaults.make("issue241-tests")
 }
 
 @MainActor
@@ -307,7 +304,7 @@ struct UpdateReadyBadgeSlotTests {
         // Restart clicked (or the staged phase cleared): the badge's open
         // popover must not hold the one-at-a-time slot hostage.
         let model = DeckPopoverModel(
-            defaults: UserDefaults(suiteName: "issue241-slot-\(UUID().uuidString)")!)
+            defaults: ScratchDefaults.make("issue241-slot"))
         let id = DeckWarningID(topic: .updateReady)
         model.toggleWarning(id)
         #expect(model.isWarningPresented(id))

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { Store } from '../src/db.mjs';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -14,14 +15,36 @@ import { claudePinnedEnvFileContent } from '../src/adapters/claude.mjs';
 const script = fileURLToPath(new URL('../scripts/install-shell-env.sh', import.meta.url));
 
 function runInstaller(home, args = []) {
-  execFileSync('/bin/sh', [script, ...args], { env: { ...process.env, HOME: home } });
+  execFileSync('/bin/sh', [script, ...args], { env: { ...process.env, HOME: home, MODELDECK_DB_PATH: path.join(home, 'modeldeck.sqlite') } });
 }
 
 function fixtureHome(t) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-shellenv-'));
+  const home = fs.mkdtempSync(path.join('/private/tmp', 'modeldeck-shellenv-'));
+  const store = new Store(path.join(home, 'modeldeck.sqlite'));
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
+  store.close();
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   return home;
 }
+
+test('shell removal refuses unmanaged homes and a symlinked shell file before writes', (t) => {
+  const home = fixtureHome(t);
+  const target = path.join(home, '.zshenv');
+  const original = '# placeholder original\n';
+  fs.writeFileSync(target, original);
+  const store = new Store(path.join(home, 'modeldeck.sqlite'));
+  store.saveSettings({ claudeManaged: false, codexManaged: false });
+  assert.throws(() => runInstaller(home, ['--remove']), /not-managed \(409\)/);
+  assert.equal(fs.readFileSync(target, 'utf8'), original);
+  store.saveSettings({ codexManaged: true });
+  store.close();
+  const other = path.join(home, 'other');
+  fs.renameSync(target, other);
+  fs.symlinkSync(other, target);
+  assert.throws(() => runInstaller(home, ['--remove']), /real file/);
+  assert.equal(fs.lstatSync(target).isSymbolicLink(), true);
+  assert.equal(fs.readFileSync(other, 'utf8'), original);
+});
 
 test('installs a block that sources the pinned env file with a readlink fallback', (t) => {
   const home = fixtureHome(t);
@@ -231,6 +254,7 @@ test('override path agrees end-to-end: daemon write path and generated block sou
   fs.chmodSync(profilesDir, 0o700);
   fs.chmodSync(profileHome, 0o700);
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => store.close());
   const service = new ModelDeckService(store, {
     claudeProfilesDir: profilesDir,

@@ -76,12 +76,13 @@ export async function enumerateTranscriptFiles(profilesDirectory, extraRoots = [
   let stat;
   try { stat = await fs.promises.stat(root); }
   catch (error) {
-    if (error?.code === 'ENOENT') throw new Error(`Claude profiles directory does not exist: ${root}`);
-    throw error;
+    if (error?.code === 'ENOENT' && extraRoots.length) stat = null;
+    else if (error?.code === 'ENOENT') throw new Error(`Claude profiles directory does not exist: ${root}`);
+    else throw error;
   }
-  if (!stat.isDirectory()) throw new Error(`Claude profiles path must be a directory: ${root}`);
+  if (stat && !stat.isDirectory()) throw new Error(`Claude profiles path must be a directory: ${root}`);
 
-  const rootEntries = (await fs.promises.readdir(root, { withFileTypes: true }))
+  const rootEntries = (stat ? await fs.promises.readdir(root, { withFileTypes: true }) : [])
     .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
     .sort(compareNames);
   const files = [];
@@ -119,7 +120,10 @@ export async function enumerateTranscriptFiles(profilesDirectory, extraRoots = [
   // symlinked parent components, so an alias of the managed directory (or of
   // another extra root) would otherwise slip past the lexical comparison and
   // double-ingest the same files under a second source label.
-  const canonicalManagedRoot = await fs.promises.realpath(root);
+  const canonicalManagedRoot = await fs.promises.realpath(root).catch(async (error) => {
+    if (error.code !== 'ENOENT') throw error;
+    return path.join(await fs.promises.realpath(path.dirname(root)), path.basename(root));
+  });
   for (const extra of Array.isArray(extraRoots) ? extraRoots : []) {
     const extraPath = typeof extra?.path === 'string' && extra.path.trim()
       ? path.resolve(extra.path)

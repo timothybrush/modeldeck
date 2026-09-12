@@ -14,6 +14,7 @@ import { Store } from '../src/db.mjs';
 import { createApp } from '../src/server.mjs';
 import {
   MEMBER_BLACKOUT_FAILURE_THRESHOLD,
+  memberBlackoutTransientStatus,
   ModelDeckService,
 } from '../src/service.mjs';
 
@@ -187,6 +188,37 @@ test('TRIPWIRE member-blackout-alert — consecutive failures fire, disable supp
     `http://127.0.0.1:${TEST_PORT}/v0/management/usage-queue?count=500`,
   ]);
 });
+
+// Issue #572 — a day-old HTTP 529 blip wore the red 'sign in again' banner.
+// TRIPWIRE #572: an overload-class streak must never carry the sign-in remedy
+// (the 401 tripwire above keeps pinning the red path), and evidence clearing
+// is untouched — no timer, one routed success still clears it.
+test('TRIPWIRE #572 — an overload-class streak is transient with the no-action remedy and still clears on success', async (t) => {
+  const data = fixture(t);
+  data.responses.push(stream.failureBatches.flat().map((record, index) => ({
+    ...record,
+    status_code: 529,
+    request_id: `blackout-overload-placeholder-${index + 1}`,
+  })));
+  await data.service.pullUsageQueue();
+  const state = await apiState(data.app);
+  assert.equal(state.memberBlackout.alerts.length, 1);
+  const alert = state.memberBlackout.alerts[0];
+  assert.equal(alert.statusCode, 529);
+  assert.equal(alert.transient, true);
+  assert.doesNotMatch(alert.remedy, /sign in/i);
+  assert.equal(alert.remedy, 'No action needed because a successful request through this subscription clears the alert.');
+
+  data.responses.push(stream.recoveryBatch);
+  await data.service.pullUsageQueue();
+  assert.deepEqual((await apiState(data.app)).memberBlackout.alerts, [], 'one routed success still clears the transient streak');
+});
+
+for (const [statusCode, expected] of [[408, true], [429, true], [499, false], [500, true], [599, true], [600, false]]) {
+  test(`TRIPWIRE #572: transient status ${statusCode} is ${expected}`, () => {
+    assert.equal(memberBlackoutTransientStatus(statusCode), expected);
+  });
+}
 
 // CodeRabbit (PR #434): with no parseable auth files the pool is unknowable —
 // `proxyPool` is omitted from the account and the recorded pool-member-only

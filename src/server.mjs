@@ -22,6 +22,7 @@ import { resetCalendarReport } from './capacity.mjs';
 import {
   HOST, PORT, DB_PATH, DATA_DIR, DAEMON_ERROR_LOG_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
+  LEGACY_CODEX_PROFILES_DIR,
   GROK_SESSIONS_DIR,
   CLIPROXY_AUTH_DIR, CLIPROXY_BIN, CLIPROXY_BASE_URL, CLIPROXY_CONFIG_DIR,
   CLIPROXY_MANAGEMENT_KEY_PATH, LANE_MANIFEST_PATH, LAUNCHCTL_PATH, ZSHENV_PATH,
@@ -46,6 +47,11 @@ const GIT_COMMIT = typeof __MODELDECK_GIT_COMMIT__ === 'string' && __MODELDECK_G
 
 const EXPOSED_ERROR_CODES = new Set([
   'active-link-blocked',
+  'not-managed',
+  'manage-required',
+  'management-in-progress',
+  'claude-unmanage-unavailable',
+  'profile-exists',
   'claude-activation-operation-timeout',
   'claude-activation-operation-still-running',
   'claude-activation-queue-timeout',
@@ -141,6 +147,7 @@ export function createApp({
     codexPath: CODEX_PATH,
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
+    codexLegacyProfilesDir: LEGACY_CODEX_PROFILES_DIR,
     grokSessionsDir: GROK_SESSIONS_DIR,
     cliproxyAuthDir: CLIPROXY_AUTH_DIR,
     cliproxyConfigDir: CLIPROXY_CONFIG_DIR,
@@ -159,9 +166,11 @@ export function createApp({
     demoFixtures: process.env.MODELDECK_DEMO_FIXTURES === '1',
   });
   const { token: sessionToken, source: tokenSource } = resolveMutationToken({ token: mutationToken });
+  let startup = Promise.resolve();
 
   const server = http.createServer(async (req, res) => {
     try {
+      await startup;
       const actualPort = server.address()?.port || port;
       // Loopback-only is the supported deployment: the peer address is
       // kernel-provided, so this holds even if MODELDECK_HOST binds wider
@@ -169,6 +178,9 @@ export function createApp({
       if (!loopbackPeer(req)) return json(res, 403, { error: 'loopback connections only' });
       if (!hostAllowed(req, actualPort)) return json(res, 403, { error: 'unexpected host header' });
       const url = new URL(req.url, `http://${host}:${actualPort}`);
+      if (ownedService.codexProfilesMigrationBlocked && url.pathname !== '/api/health') {
+        return json(res, 503, { error: ownedService.codexProfilesMigrationWarning });
+      }
       const otlpKind = req.method === 'POST' && url.pathname === '/otlp/v1/metrics'
         ? 'metrics'
         : req.method === 'POST' && url.pathname === '/otlp/v1/logs'
@@ -204,7 +216,10 @@ export function createApp({
         });
       }
       if (req.method === 'GET' && url.pathname === '/api/health') {
-        return json(res, 200, { ok: true, name: 'ModelDeck', version: VERSION, MDGitCommit: GIT_COMMIT, tokenSource, projectsRoot: ownedService.projectsRoot });
+        return json(res, 200, {
+          ok: true, name: 'ModelDeck', version: VERSION, MDGitCommit: GIT_COMMIT, tokenSource, projectsRoot: ownedService.projectsRoot,
+          ...(ownedService.codexProfilesMigrationWarning ? { warning: ownedService.codexProfilesMigrationWarning } : {}),
+        });
       }
       if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, await ownedService.state());
       if (req.method === 'GET' && url.pathname === '/api/config-lint') {
@@ -420,7 +435,7 @@ export function createApp({
       if (req.method === 'GET' && url.pathname === '/api/settings') return json(res, 200, ownedStore.getSettings());
       if (req.method === 'PUT' && url.pathname === '/api/settings') {
         const previous = ownedStore.getSettings();
-        const settings = ownedStore.saveSettings(await body(req));
+        const settings = await ownedService.updateSettings(await body(req));
         try {
           await ownedService.applySharedScopeSettings(previous, settings);
         } catch (error) {
@@ -473,8 +488,11 @@ export function createApp({
       }
       if (req.method === 'POST' && url.pathname === '/api/accounts') {
         const input = await body(req);
-        const account = await ownedService.saveAccount(input);
-        return json(res, 201, { account: ownedService.accountForPublicResponse(account) });
+        const { profileNote, ...account } = await ownedService.saveAccount(input);
+        return json(res, 201, {
+          account: ownedService.accountForPublicResponse(account),
+          ...(profileNote ? { profileNote } : {}),
+        });
       }
       const defaultMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/default$/);
       if (req.method === 'POST' && defaultMatch) {
@@ -671,6 +689,7 @@ export function createApp({
       json(res, error.statusCode || 400, {
         error: error.message,
         ...(EXPOSED_ERROR_CODES.has(error.code) ? { code: error.code } : {}),
+        ...(error.code === 'profile-exists' ? { profile: error.profile } : {}),
       });
     }
   });
@@ -683,21 +702,27 @@ export function createApp({
     tokenSource,
     listen(callback) {
       return server.listen(port, host, () => {
-        // Retention is daemon maintenance, not provider polling: start it even
-        // when auto-refresh is disabled or the daemon serves demo fixtures.
-        ownedService.startUsageSnapshotRetention?.();
-        ownedService.startUsageQueueConsumer?.();
-        void ownedService.startConfigLint?.()?.catch((error) => {
-          console.error(`[modeldeck] config lint startup failed: ${error?.message || error}`);
+        // Finish filesystem/store migration before any reader, writer, or
+        // provider poll can observe a half-moved profile. HTTP waits too.
+        startup = Promise.resolve(ownedService.migrateCodexProfilesDir?.()).then(() => {
+          if (ownedService.codexProfilesMigrationBlocked) { callback?.(); return; }
+          // Retention is daemon maintenance, not provider polling: start it even
+          // when auto-refresh is disabled or the daemon serves demo fixtures.
+          ownedService.startUsageSnapshotRetention?.();
+          ownedService.startUsageQueueConsumer?.();
+          void ownedService.startConfigLint?.()?.catch((error) => {
+            console.error(`[modeldeck] config lint startup failed: ${error?.message || error}`);
+          });
+          void ownedService.startWarehouseIngest?.()?.catch((error) => {
+            console.error(`[modeldeck] warehouse ingest startup failed: ${error?.message || error}`);
+          });
+          ownedService.startAutoRefresh();
+          callback?.();
         });
-        void ownedService.startWarehouseIngest?.()?.catch((error) => {
-          console.error(`[modeldeck] warehouse ingest startup failed: ${error?.message || error}`);
-        });
-        ownedService.startAutoRefresh();
-        callback?.();
       });
     },
     async close() {
+      await startup;
       await Promise.all([
         ownedService.stopAutoRefresh(),
         ownedService.stopUsageSnapshotRetention?.() || Promise.resolve(),

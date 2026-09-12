@@ -106,10 +106,7 @@ private func poolFixture() -> DeckState {
 @MainActor
 struct Issue319HideShowTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "issue319-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("issue319-tests")
     }
 
     private func claudeColumn(

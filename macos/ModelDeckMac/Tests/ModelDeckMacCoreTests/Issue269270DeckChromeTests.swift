@@ -16,10 +16,7 @@ import Testing
 // install lands on the reduced default without touching anything.
 
 private func freshDefaults(_ name: String) -> UserDefaults {
-    let suite = "modeldeck-chrome-\(name)-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suite)!
-    defaults.removePersistentDomain(forName: suite)
-    return defaults
+    ScratchDefaults.make("modeldeck-chrome-\(name)")
 }
 
 @Suite("Deck glass (issue #270)")

@@ -18,6 +18,7 @@ function fixture(options = {}) {
   fs.mkdirSync(secondHome, { recursive: true, mode: 0o700 });
   fs.chmodSync(profilesDir, 0o700);
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const first = store.saveAccount({ provider: 'claude', label: 'First', profileRef: firstHome, isDefault: true });
   const second = store.saveAccount({ provider: 'claude', label: 'Second', profileRef: secondHome });
   const sharedDir = path.join(root, 'data', 'shared');
@@ -62,6 +63,7 @@ function addUserMemory(home, files) {
 
 test('shared user scope defaults off and validates as a boolean setting', () => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   try {
     assert.equal(store.getSettings().sharedUserScopeEnabled, false);
     assert.equal(store.saveSettings({ sharedUserScopeEnabled: true }).sharedUserScopeEnabled, true);
@@ -1008,11 +1010,13 @@ test('a second shared-scope mutation receives a 409 while the first is in flight
 
 test('a settings PUT conflict restores the prior shared-scope opt-in value', async (t) => {
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => store.close());
   const conflict = new Error('a shared-scope operation is already in progress');
   conflict.statusCode = 409;
   const queueReschedules = [];
   const service = {
+    updateSettings: async (input) => store.saveSettings(input),
     applySharedScopeSettings: async () => { throw conflict; },
     rescheduleUsageQueueConsumer: async (settings) => { queueReschedules.push(settings); },
     stopAutoRefresh() {},

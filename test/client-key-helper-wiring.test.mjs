@@ -35,6 +35,7 @@ function fixture(options = {}) {
     fs.chmodSync(home, 0o700);
   }
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const service = new ModelDeckService(store, {
     claudeActiveLink: path.join(root, 'active', '.claude'),
     codexActiveLink: path.join(root, 'active', '.codex'),

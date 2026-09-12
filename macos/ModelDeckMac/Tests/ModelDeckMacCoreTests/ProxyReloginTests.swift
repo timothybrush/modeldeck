@@ -404,6 +404,62 @@ struct ProxyReloginPresentationTests {
         #expect(presentation?.display == .action(prominent: false))
     }
 
+    @Test func aRestingMemberShowsLocalResetTimeWithoutPromotingSignIn() {
+        let model = makeModel(manager: ReloginStub())
+        let reset = Date(timeIntervalSince1970: 1_800_000_000)
+        let formatter = ISO8601DateFormatter()
+        for fractional in [false, true] {
+            formatter.formatOptions = fractional
+                ? [.withInternetDateTime, .withFractionalSeconds] : [.withInternetDateTime]
+            let resting = account(proxyCredential: "resting", proxyCredentialDetail: formatter.string(from: reset))
+            let expected = "Rate limited · back at \(DateFormatter.localizedString(from: reset, dateStyle: .none, timeStyle: .short))"
+            #expect(ProxyRelogin.credentialText(for: resting) == expected)
+            #expect(ProxyRelogin.credentialIsBroken(resting) == false)
+            let presentation = model.presentation(for: resting)
+            #expect(presentation?.credentialText == expected)
+            #expect(presentation?.credentialIsBroken == false)
+            #expect(presentation?.display == .quiet)
+            for repairedPending in [false, true] {
+                let alert = MemberBlackoutAlert(
+                    accountId: resting.id, provider: "claude", label: "Studio",
+                    consecutiveFailures: 3, statusCode: 429, repairedPending: repairedPending
+                )
+                let withStreak = model.presentation(for: resting, routedFailures: alert)
+                #expect(withStreak?.credentialText == expected)
+                #expect(withStreak?.credentialIsBroken == false)
+                #expect(withStreak?.display == .quiet)
+            }
+        }
+    }
+
+    @Test func aRestingMemberWithNoUsableResetTimeStaysQuiet() {
+        let model = makeModel(manager: ReloginStub())
+        for detail: String? in [nil, "", "not-an-instant"] {
+            let resting = account(proxyCredential: "resting", proxyCredentialDetail: detail)
+            let presentation = model.presentation(for: resting)
+            #expect(presentation?.credentialText == "Rate limited · resting")
+            #expect(presentation?.credentialIsBroken == false)
+            #expect(presentation?.display == .quiet)
+        }
+    }
+
+    @Test func aRestingDeckBannerUsesQuietCopyForDisplayAndVoiceOver() throws {
+        let package = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(
+            contentsOf: package.appendingPathComponent("Sources/ModelDeckMac/DeckPopoverView.swift"),
+            encoding: .utf8
+        )
+        #expect(source.contains("account.proxyCredential?.lowercased() == \"resting\""))
+        #expect(source.contains("? ProxyRelogin.credentialText(for: account) : nil"))
+        #expect(source.contains("let quiet = restingText != nil || repaired"))
+        #expect(source.contains("let visible = restingText.map { \"\\(alert.label): \\($0)\" }"))
+        #expect(source.contains("let message = restingText != nil ? visible : (repaired"))
+        #expect(source.contains("foregroundStyle(quiet ? Color.secondary : Color.red)"))
+        #expect(source.contains("if !quiet || relogin?.display.isRunning == true {"))
+        #expect(source.contains(".accessibilityLabel(\"Pool alert. \\(message)\")"))
+    }
+
     @Test func unavailableRendersItsReason() {
         let model = makeModel(manager: ReloginStub())
         let reason = "This CLIProxyAPI install has no management key yet."

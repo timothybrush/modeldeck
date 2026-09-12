@@ -25,10 +25,7 @@ import Testing
 @MainActor
 struct SettingsEchoLoopTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "echo-loop-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("echo-loop-tests")
     }
 
     // MARK: - DeckPopoverModel.adopt

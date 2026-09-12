@@ -91,10 +91,7 @@ private func capturedFieldState() -> DeckState {
 @MainActor
 struct Issue317ZeroWeightFilterFieldTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "issue317-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("issue317-tests")
     }
 
     @Test func sixBenchedRowsDisplayZeroWhileLiveWeightsArePositive() {

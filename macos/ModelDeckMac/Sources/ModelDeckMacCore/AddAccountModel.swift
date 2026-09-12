@@ -52,6 +52,8 @@ public protocol LoginLaunching: Sendable {
 public final class AddAccountModel: ObservableObject {
     public enum Step: Equatable, Sendable {
         case details
+        case manageProvider
+        case adoptExistingProfile(ExistingProfileSummary)
         /// Issue #586: a real legacy `~/.claude` blocked the activation the
         /// sign-in needs. Offers in-app adoption instead of a dead-end error.
         case adoptLegacy
@@ -106,6 +108,7 @@ public final class AddAccountModel: ObservableObject {
     private let launcher: any LoginLaunching
     private let stateProvider: any DeckStateProviding
     private let activator: any AccountActivating
+    private var pendingCreate: AccountCreate?
 
     public init(
         onboarding: any AccountOnboarding,
@@ -124,23 +127,44 @@ public final class AddAccountModel: ObservableObject {
     /// A failed terminal launch is not fatal — the command stays available
     /// for copy/paste and retry.
     @discardableResult
-    public func begin(provider: DeckProvider, label: String, purpose: String, colorHex: String?) async -> Bool {
+    public func begin(provider: DeckProvider, label: String, purpose: String, colorHex: String?, manageProvider: Bool? = nil) async -> Bool {
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLabel.isEmpty else {
             lastError = "The label can't be empty."
             return false
         }
         guard !isBusy else { return false }
+        return await createAccount(AccountCreate(
+            provider: provider.rawValue,
+            label: trimmedLabel,
+            purpose: purpose.trimmingCharacters(in: .whitespacesAndNewlines),
+            color: colorHex,
+            manageProvider: manageProvider
+        ))
+    }
+
+    @discardableResult
+    public func resolveExistingProfile(startFresh: Bool) async -> Bool {
+        guard case .adoptExistingProfile = step, var create = pendingCreate, !isBusy else { return false }
+        create.existingProfile = startFresh ? "fresh" : "adopt"
+        return await createAccount(create)
+    }
+
+    @discardableResult
+    public func retrySignIn() async -> Bool {
+        guard step == .signIn, account != nil, let create = pendingCreate, !isBusy else { return false }
+        return await createAccount(create)
+    }
+
+    private func createAccount(_ create: AccountCreate) async -> Bool {
         isBusy = true
         lastError = nil
+        pendingCreate = create
         defer { isBusy = false }
         do {
-            let created = try await onboarding.createAccount(AccountCreate(
-                provider: provider.rawValue,
-                label: trimmedLabel,
-                purpose: purpose.trimmingCharacters(in: .whitespacesAndNewlines),
-                color: colorHex
-            ))
+            let created: DeckAccount
+            if let account { created = account }
+            else { created = try await onboarding.createAccount(create) }
             account = created
             let login = try await onboarding.loginCommand(accountID: created.id)
             // Issue #99: the daemon's selected flow demands activating the
@@ -160,8 +184,8 @@ public final class AddAccountModel: ObservableObject {
                     // (the clobber guard). Every Mac that ever ran Claude
                     // Code hits this on its FIRST add — never a dead end:
                     // offer in-app adoption instead of the raw refusal.
-                    guard provider == .claude,
-                          case DaemonClientError.daemonCodedError(_, let code, _) = error,
+                    guard create.provider == DeckProvider.claude.rawValue,
+                          case DaemonClientError.daemonCodedError(_, let code, _, _) = error,
                           code == DaemonClientError.activeLinkBlockedCode
                     else { throw error }
                     // Review #590 round 2: the command fetched above is kept
@@ -169,19 +193,42 @@ public final class AddAccountModel: ObservableObject {
                     // sign-in step with something to run even if the
                     // post-adoption re-fetch fails.
                     loginCommand = login.command
+                    pendingCreate = nil
                     step = .adoptLegacy
                     return true
                 }
                 didActivateForLogin = true
             }
             loginCommand = login.command
+            pendingCreate = nil
             step = .signIn
             launchLogin()
             return true
         } catch {
+            if account == nil,
+               case DaemonClientError.daemonCodedError(_, "manage-required", 409, _) = error {
+                step = .manageProvider
+                return true
+            }
+            if account == nil,
+               case DaemonClientError.daemonCodedError(_, "profile-exists", 409, let profile?) = error {
+                step = .adoptExistingProfile(profile)
+                return true
+            }
+            if account != nil {
+                loginCommand = nil
+                step = .signIn
+            }
             lastError = SettingsSyncModel.message(for: error)
             return false
         }
+    }
+
+    @discardableResult
+    public func manageSwitching() async -> Bool {
+        guard step == .manageProvider, var create = pendingCreate, !isBusy else { return false }
+        create.manageProvider = true
+        return await createAccount(create)
     }
 
     // MARK: - Issue #586: legacy ~/.claude adoption
@@ -257,7 +304,7 @@ public final class AddAccountModel: ObservableObject {
     static func isAlreadyManagedRefusal(_ error: Error) -> Bool {
         switch error {
         case DaemonClientError.daemonError(let message, 409),
-             DaemonClientError.daemonCodedError(let message, _, 409):
+             DaemonClientError.daemonCodedError(let message, _, 409, _):
             return message.contains("already managed")
         default:
             return false
@@ -598,6 +645,7 @@ public final class AddAccountModel: ObservableObject {
     public func reset() {
         cancelPendingConnect()
         step = .details
+        pendingCreate = nil
         if connectTask == nil { isBusy = false }
         lastError = nil
         account = nil

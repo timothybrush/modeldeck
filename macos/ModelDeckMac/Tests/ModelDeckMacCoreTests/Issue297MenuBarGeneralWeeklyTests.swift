@@ -85,7 +85,7 @@ struct MenuBarGeneralWeeklyDotTests {
 @MainActor
 struct GeneralWeeklyFocusChangeHookTests {
     private func model() -> DeckPopoverModel {
-        let defaults = UserDefaults(suiteName: "issue297-tests-\(UUID().uuidString)")!
+        let defaults = ScratchDefaults.make("issue297-tests")
         return DeckPopoverModel(defaults: defaults)
     }
 

@@ -193,6 +193,7 @@ function makeFixture({ fetchClaude, serviceOptions } = {}) {
   fs.mkdirSync(profileB, { recursive: true, mode: 0o700 });
   fs.chmodSync(profilesDir, 0o700);
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const accountA = store.saveAccount({ provider: 'claude', label: 'Work', profileRef: profileA, isDefault: true });
   const accountB = store.saveAccount({ provider: 'claude', label: 'Personal', profileRef: profileB });
   const statuslineDir = path.join(root, 'statusline');

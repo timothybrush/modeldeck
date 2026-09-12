@@ -44,10 +44,7 @@ private func issue326Snapshot(
 @MainActor
 struct Issue326ByRemainingTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "issue326-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("issue326-tests")
     }
 
     private func visibleIDs(

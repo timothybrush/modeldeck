@@ -46,7 +46,7 @@ private let projectRoute = DashboardRoute(
 )
 
 private func throwawayDefaults() -> UserDefaults {
-    UserDefaults(suiteName: "issue424-tests-\(UUID().uuidString)")!
+    ScratchDefaults.make("issue424-tests")
 }
 
 @Suite("Dashboard deep-link codec (issue #424)")

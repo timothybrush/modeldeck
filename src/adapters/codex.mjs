@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { extractIdentity } from './identity.mjs';
-import { createProviderProfileHelpers } from './provider-profile.mjs';
+import { validateUnmanagedHome, createProviderProfileHelpers } from './provider-profile.mjs';
 import { inspectJsonObjectAt, inspectJsonObjectDocument } from '../shared-scope.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -281,12 +281,14 @@ export async function readCodexLoginStatus({
   binary = 'codex',
   codexHome,
   profilesDir,
+  unmanagedHome,
   timeoutMs = 20_000,
   run = execFileAsync,
   readFile = fs.promises.readFile,
 } = {}) {
   if (!codexHome) throw new Error('CODEX_HOME is required');
   if (profilesDir) await validateCodexProfileHome({ profileRef: codexHome, profilesDir });
+  else if (unmanagedHome) await validateUnmanagedHome(codexHome, unmanagedHome);
   else await assertOwnerOnlyCodexHome(codexHome);
   const plan = await readCodexPlan({ codexHome, readFile });
   try {

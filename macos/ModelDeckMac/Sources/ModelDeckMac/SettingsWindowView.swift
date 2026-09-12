@@ -285,6 +285,7 @@ struct AccountsSettingsPane: View {
         let activationState = state?.activationState(for: section.provider) ?? .unknown
         AccountRosterRow(
             account: account,
+            showActivation: state?.isManaged(section.provider) == true,
             isBusy: accountsModel.busyAccountID == account.id,
             canEdit: AccountsSettingsModel.canEdit(account),
             isActivating: deckModel.activatingAccountID == account.id,
@@ -297,7 +298,7 @@ struct AccountsSettingsPane: View {
             // selected row keeps issue #61's Complete Activation button when
             // its activation is link-pending. Both run the SAME unchanged
             // machinery (optimistic flip → POST → verify-or-revert).
-            onActivate: deckModel.canActivate
+            onActivate: deckModel.canActivate && state?.isManaged(section.provider) == true
                 && (!account.isDefault || activationState.needsLinkCompletion)
                 ? { Task { await deckModel.activate(activationRow(for: account)) } }
                 : nil,
@@ -598,6 +599,7 @@ struct PostActivationNoticeView: View {
 /// menu (both paths). No color dots anywhere.
 struct AccountRosterRow: View {
     let account: DeckAccount
+    var showActivation = true
     let isBusy: Bool
     let canEdit: Bool
     var isActivating: Bool = false
@@ -668,7 +670,7 @@ struct AccountRosterRow: View {
                     HStack(spacing: 6) {
                         Text(account.label)
                             .font(.system(size: 12.5, weight: .semibold))
-                        if account.isDefault {
+                        if showActivation && account.isDefault {
                             ActiveMarkerView(indicator: ActiveIndicator.indicator(for: activationState))
                         }
                         if account.hasDuplicateToken {
@@ -752,7 +754,7 @@ struct AccountRosterRow: View {
                 .opacity(isHovered ? 1 : 0)
                 .help("Edit or remove this subscription (also on right-click)")
                 .accessibilityLabel("Actions for \(account.label)")
-                radio
+                if showActivation { radio }
             }
             if let signInError {
                 Text(signInError)
@@ -1527,6 +1529,31 @@ struct GeneralSettingsPane: View {
 
     var body: some View {
         Form {
+            Section("Switching") {
+                ForEach([DeckProvider.claude, .codex], id: \.self) { provider in
+                    VStack(alignment: .leading, spacing: 3) {
+                        let state = statusModel.deckState
+                        let reason = state?.managementDisabledReason(for: provider)
+                        Toggle("Manage account switching for \(provider.displayName)", isOn: Binding(
+                            get: { provider == .claude ? settingsSync.settings.claudeManaged == true : settingsSync.settings.codexManaged == true },
+                            set: { enabled in
+                                Task {
+                                    await settingsSync.setProviderManaged(provider, enabled: enabled)
+                                    await statusModel.refresh()
+                                }
+                            }
+                        ))
+                        .disabled(!settingsSync.isLoaded || settingsSync.isSaving || state?.managed == nil || reason != nil)
+                        Text(reason ?? (state?.managed == nil
+                            ? "Update the background service to change this setting."
+                            : provider == .claude
+                                ? "Moves ~/.claude; verify the sign-in afterwards."
+                                : "With switching on, ~/.codex follows your selection."))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             Section("Refresh") {
                 Toggle("Refresh usage automatically", isOn: binding(
                     get: { $0.autoRefreshEnabled },

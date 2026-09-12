@@ -373,7 +373,14 @@ function sameFileStat(left, right) {
   return left.size === right.size && left.mtimeMs === right.mtimeMs && left.ino === right.ino;
 }
 
-function sourceFromStoredPath(profilesRoot, file) {
+function sourceFromStoredPath(profilesRoot, file, profileHomes = []) {
+  for (const home of profileHomes) {
+    const relative = path.relative(home.path, file);
+    const directory = relative.split(path.sep)[0];
+    if (['sessions', 'archived_sessions'].includes(directory)) {
+      return { file, profileSlug: home.profileSlug, archived: directory === 'archived_sessions' };
+    }
+  }
   const relative = path.relative(profilesRoot, file);
   if (!relative || path.isAbsolute(relative) || relative.startsWith(`..${path.sep}`)) return null;
   const [profileSlug, directory] = relative.split(path.sep);
@@ -476,6 +483,7 @@ function mergedCodexReplay(sources) {
 async function reconcileCodexSessionSources({
   store,
   profilesRoot,
+  profileHomes,
   sourceSessionId,
   currentSource,
   currentStat,
@@ -488,7 +496,7 @@ async function reconcileCodexSessionSources({
     sourceSessionId,
     CODEX_ROLLOUT_PARSER,
   )) {
-    const source = sourceFromStoredPath(profilesRoot, file);
+    const source = sourceFromStoredPath(profilesRoot, file, profileHomes);
     if (source && fs.existsSync(file)) candidates.set(file, source);
   }
   candidates.set(currentSource.file, currentSource);
@@ -563,16 +571,18 @@ async function reconcileCodexSessionSources({
 export async function ingestCodexRollouts({
   store,
   profilesRoot,
+  profileHomes = [],
   machine = 'studio',
   warn = () => {},
 } = {}) {
   if (!store?.ingestCodexSession) throw new Error('Codex rollout ingest requires a Store');
   if (typeof profilesRoot !== 'string' || !profilesRoot.trim()) throw new Error('Codex profiles root is required');
   const resolvedRoot = path.resolve(profilesRoot);
-  if (!fs.existsSync(resolvedRoot)) throw new Error(`Codex profiles root does not exist: ${resolvedRoot}`);
-  if (!fs.statSync(resolvedRoot).isDirectory()) throw new Error(`Codex profiles root must be a directory: ${resolvedRoot}`);
+  const rootExists = fs.existsSync(resolvedRoot);
+  if (!rootExists && !profileHomes.length) throw new Error(`Codex profiles root does not exist: ${resolvedRoot}`);
+  if (rootExists && !fs.statSync(resolvedRoot).isDirectory()) throw new Error(`Codex profiles root must be a directory: ${resolvedRoot}`);
 
-  const profileEntries = fs.readdirSync(resolvedRoot, { withFileTypes: true })
+  const profileEntries = (rootExists ? fs.readdirSync(resolvedRoot, { withFileTypes: true }) : [])
     .filter((entry) => {
       if (entry.isDirectory()) return true;
       if (!entry.isSymbolicLink()) return false;
@@ -580,6 +590,24 @@ export async function ingestCodexRollouts({
       catch { return false; }
     })
     .sort((left, right) => left.name.localeCompare(right.name));
+  for (const home of profileHomes) {
+    // One unavailable real home must not fail the whole Codex ingest run:
+    // it is skipped with a warning and the managed profiles still scan.
+    let canonical;
+    try {
+      const stat = fs.lstatSync(home.path);
+      if (!stat.isDirectory()) throw new Error('The Codex home must be a real directory.');
+      canonical = fs.realpathSync(home.path);
+      const root = rootExists ? fs.realpathSync(resolvedRoot) : resolvedRoot;
+      if (canonical === root || canonical.startsWith(root + path.sep) || root.startsWith(canonical + path.sep)) {
+        throw new Error('The Codex home overlaps the managed profiles directory.');
+      }
+    } catch (error) {
+      warn(`codex-rollout-ingest: skipped unavailable Codex home ${home.profileSlug}: ${error?.message || error}`);
+      continue;
+    }
+    profileEntries.push({ name: home.profileSlug, path: canonical });
+  }
   const summary = {
     profiles: profileEntries.length,
     files: 0,
@@ -600,7 +628,7 @@ export async function ingestCodexRollouts({
 
   let reconciledPaths = null;
   for (const profile of profileEntries) {
-    const profilePath = path.join(resolvedRoot, profile.name);
+    const profilePath = profile.path || path.join(resolvedRoot, profile.name);
     let files;
     try {
       const entries = fs.readdirSync(profilePath, { withFileTypes: true });
@@ -668,6 +696,7 @@ export async function ingestCodexRollouts({
           const reconciled = await reconcileCodexSessionSources({
             store,
             profilesRoot: resolvedRoot,
+            profileHomes,
             sourceSessionId,
             currentSource: source,
             currentStat: fileStat,

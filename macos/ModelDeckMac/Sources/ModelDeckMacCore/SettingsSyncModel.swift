@@ -172,6 +172,13 @@ public final class SettingsSyncModel: ObservableObject {
     // MARK: - Field updates (each a no-op when unchanged, so live-model
     // echoes — e.g. the popover's own layout picker — never loop).
 
+    public func setProviderManaged(_ provider: DeckProvider, enabled: Bool) async {
+        guard provider == .claude || provider == .codex else { return }
+        await update(provider == .claude
+            ? DaemonSettingsPatch(claudeManaged: enabled)
+            : DaemonSettingsPatch(codexManaged: enabled))
+    }
+
     public func setAutoRefreshEnabled(_ enabled: Bool) async {
         guard enabled != settings.autoRefreshEnabled else { return }
         await update(DaemonSettingsPatch(autoRefreshEnabled: enabled))

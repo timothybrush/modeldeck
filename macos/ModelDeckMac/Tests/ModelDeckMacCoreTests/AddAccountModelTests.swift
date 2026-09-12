@@ -178,6 +178,106 @@ struct AddAccountModelTests {
         ])
     }
 
+    private var existingProfile: ExistingProfileSummary {
+        ExistingProfileSummary(path: "/profiles/work", name: "work", transcripts: 3, lastModified: "2026-09-10T12:00:00.000Z")
+    }
+
+    @Test func profileExistsOffersAdoptionBeforeLogin() async {
+        let backend = StubOnboardingBackend()
+        backend.createError = DaemonClientError.daemonCodedError(
+            message: "A profile already exists", code: "profile-exists", status: 409, profile: existingProfile
+        )
+        let model = makeModel(backend)
+        #expect(await model.begin(provider: .claude, label: "Work", purpose: "", colorHex: nil))
+        #expect(model.step == .adoptExistingProfile(existingProfile))
+        #expect(model.account == nil)
+        #expect(model.lastError == nil)
+        #expect(!model.isBusy)
+        #expect(backend.loginCommandRequests.isEmpty)
+        #expect(backend.activatedIDs.isEmpty)
+        #expect(backend.launchedCommands.isEmpty)
+    }
+
+    @Test(arguments: [true, false])
+    func existingProfileChoiceRepostsAndContinuesNormalLogin(startFresh: Bool) async {
+        let backend = StubOnboardingBackend()
+        backend.createError = DaemonClientError.daemonCodedError(
+            message: "A profile already exists", code: "profile-exists", status: 409, profile: existingProfile
+        )
+        backend.loginResult = activationLogin
+        backend.stateAfterMutation = stateWithPriorActive
+        let model = makeModel(backend)
+        #expect(await model.begin(provider: .claude, label: "  Work  ", purpose: " client work ", colorHex: "#d97757"))
+        backend.createError = nil
+        #expect(await model.resolveExistingProfile(startFresh: startFresh))
+        #expect(backend.created.count == 2)
+        #expect(backend.created.last == AccountCreate(
+            provider: "claude", label: "Work", purpose: "client work", color: "#d97757",
+            existingProfile: startFresh ? "fresh" : "adopt"
+        ))
+        #expect(model.step == .signIn)
+        #expect(backend.loginCommandRequests == ["acct-1"])
+        #expect(backend.activatedIDs == ["acct-1"])
+        #expect(backend.launchedCommands.count == 1)
+        #expect(await model.confirmSignedIn())
+        #expect(model.step == .confirm)
+        #expect(backend.activatedIDs == ["acct-1", "acct-prior"])
+    }
+
+    @Test func addAccountClientDecodesProfileExistsSummary() async {
+        let transport = StubTransport(stubs: [
+            .init(status: 200, body: #"{"token":"fixture-token"}"#),
+            .init(status: 409, body: #"{"error":"Choose a profile","code":"profile-exists","profile":{"path":"/profiles/work","name":"work","transcripts":3,"lastModified":"2026-09-10T12:00:00.000Z"}}"#),
+        ])
+        let client = DaemonClient(transport: transport)
+        await #expect(throws: DaemonClientError.daemonCodedError(
+            message: "Choose a profile", code: "profile-exists", status: 409, profile: existingProfile
+        )) {
+            _ = try await client.createAccount(AccountCreate(provider: "claude", label: "Work", purpose: ""))
+        }
+    }
+
+    @Test(arguments: [true, false])
+    func existingProfilePostCreateFailureCanRetryWithoutAnotherAccount(activationFails: Bool) async {
+        let backend = StubOnboardingBackend()
+        backend.createError = DaemonClientError.daemonCodedError(
+            message: "Choose a profile", code: "profile-exists", status: 409, profile: existingProfile
+        )
+        let model = makeModel(backend)
+        #expect(await model.begin(provider: .claude, label: "Work", purpose: "", colorHex: nil))
+        backend.createError = nil
+        if activationFails {
+            backend.loginResult = activationLogin
+            backend.activateError = DaemonClientError.httpStatus(503)
+        } else {
+            backend.loginCommandError = DaemonClientError.httpStatus(503)
+        }
+        #expect(!(await model.resolveExistingProfile(startFresh: false)))
+        #expect(model.step == .signIn)
+        #expect(model.account?.id == "acct-1")
+        #expect(backend.launchedCommands.isEmpty)
+        backend.activateError = nil
+        backend.loginCommandError = nil
+        #expect(await model.retrySignIn())
+        #expect(backend.created.count == 2)
+        #expect(backend.launchedCommands.count == 1)
+        #expect(model.step == .signIn)
+    }
+
+    @Test(arguments: ["fresh", "adopt"])
+    func addAccountClientEncodesExistingProfileChoiceAndReadsNote(choice: String) async throws {
+        let transport = StubTransport(stubs: [
+            .init(status: 200, body: #"{"token":"fixture-token"}"#),
+            .init(status: 201, body: #"{"account":{"id":"acct-1","provider":"codex","label":"Work","enabled":true,"isDefault":false},"profileNote":"The old folder was left at /profiles/work."}"#),
+        ])
+        let client = DaemonClient(transport: transport)
+        let account = try await client.createAccount(AccountCreate(provider: "codex", label: "Work", purpose: "", existingProfile: choice))
+        let payload = try #require(transport.requests.last?.httpBody)
+        let decoded = try JSONDecoder().decode(AccountCreate.self, from: payload)
+        #expect(decoded.existingProfile == choice)
+        #expect(account.profileNote == "The old folder was left at /profiles/work.")
+    }
+
     @Test("Happy path: create, sign in, verify, land with first usage pull")
     func happyPath() async {
         let backend = StubOnboardingBackend()
@@ -592,7 +692,7 @@ struct AddAccountModelTests {
 
         let began = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
         #expect(!began)
-        #expect(model.step == .details)
+        #expect(model.step == .signIn) // Retry the saved account; never register another.
         #expect(model.lastError == "account is disabled")
     }
 

@@ -238,7 +238,7 @@ struct SharedFormatWriteTests {
         // the header currently renders — including when what it renders
         // came from a migrated 1.0.2 suffix.
         let deck = DeckPopoverModel(
-            defaults: UserDefaults(suiteName: "issue488-\(UUID().uuidString)")!
+            defaults: ScratchDefaults.make("issue488")
         )
         var flips: [(DeckProvider, MenuBarPinResolver.TotalFormat)] = []
         deck.onSetPoolTotalFormat = { flips.append(($0, $1)) }

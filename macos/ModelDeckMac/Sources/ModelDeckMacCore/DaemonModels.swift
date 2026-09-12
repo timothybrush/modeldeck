@@ -37,6 +37,8 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// The provider profile reference (CLAUDE_CONFIG_DIR / CODEX_HOME
     /// path). Needed to round-trip edits through `POST /api/accounts`.
     public var profileRef: String?
+    /// Creation-only notice; never persisted or sent back on account edits.
+    public var profileNote: String? = nil
     public var enabled: Bool
     public var isDefault: Bool
     /// Daemon-side account metadata (issue #26, Claude half): carries the
@@ -103,13 +105,13 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// (the #263 Keychain-pointer route). Claude only, same skew contract.
     public var helperRouted: Bool?
     /// Issue #396: CLIProxyAPI's OWN verdict on this pool member's
-    /// credential — "ok" / "error" / "disabled". Emitted only for members,
+    /// credential — "ok" / "error" / "disabled" / "resting". Emitted only for members,
     /// and only when the proxy's management API could actually be asked; a
     /// machine with no management key leaves it absent, which means UNKNOWN
     /// and renders nothing. "error" is the expired-credential state the
     /// 2026-08-12 field incident produced.
     public var proxyCredential: String?
-    /// The proxy's own short reason for a non-ok credential ("unauthorized").
+    /// A short error reason, or the ISO retry instant when the member is resting.
     public var proxyCredentialDetail: String?
     /// Issue #396: whether the in-app repair can run for this account, and
     /// the plain reason when it cannot (no management key — #431 — a
@@ -797,6 +799,12 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
     /// When that sign-in was observed, so a settled outcome recorded before it
     /// can be recognized as stale news.
     public var repairedAt: String?
+    /// Issue #572, additive: the daemon classified this streak as an
+    /// overload-class provider failure (5xx/timeout/rate-limit) — nothing is
+    /// wrong with the credential, so the alert renders in the #539 quiet
+    /// style and promotes no sign-in repair. Absent on an older daemon,
+    /// which simply keeps the red state.
+    public var transient: Bool?
 
     public var id: String { accountId }
 
@@ -810,7 +818,8 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
         statusCode: Int? = nil,
         remedy: String = "Sign in again to restore proxy routing.",
         repairedPending: Bool? = nil,
-        repairedAt: String? = nil
+        repairedAt: String? = nil,
+        transient: Bool? = nil
     ) {
         self.accountId = accountId
         self.provider = provider
@@ -822,6 +831,7 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
         self.remedy = remedy
         self.repairedPending = repairedPending
         self.repairedAt = repairedAt
+        self.transient = transient
     }
 
     /// Issue #537 (Tim): plain words, no proxy jargon — "last N requests
@@ -832,6 +842,9 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
     }
 
     public var isRepairedPending: Bool { repairedPending == true }
+
+    /// Issue #572: overload-class streak — quiet style, no promoted repair.
+    public var isTransient: Bool { transient == true }
 
     /// Issue #539: the post-repair line. Nothing is broken any more — the deck
     /// is only waiting for a request to prove it — so the words carry no alarm
@@ -997,6 +1010,8 @@ public struct ModelDropStatus: Codable, Equatable, Sendable {
 /// `GET /api/state` — only the slices Phase 3 needs. The daemon also returns
 /// `projects` and `launches`; they are ignored here and picked up in Phase 4+.
 public struct DeckState: Codable, Equatable, Sendable {
+    public var managed: [String: Bool]?
+    public var managementBlocked: [String: String]?
     public var accounts: [DeckAccount]
     public var usage: [UsageSnapshot]
     /// Per-provider PHYSICAL activation truth (issue #55/#56). Optional by
@@ -1034,8 +1049,12 @@ public struct DeckState: Codable, Equatable, Sendable {
         daemon: DeckDaemonRuntime? = nil,
         memberBlackout: MemberBlackoutStatus? = nil,
         modelDrop: ModelDropStatus? = nil,
-        sharedScope: SharedScopeStatus? = nil
+        sharedScope: SharedScopeStatus? = nil,
+        managed: [String: Bool]? = nil,
+        managementBlocked: [String: String]? = nil
     ) {
+        self.managed = managed
+        self.managementBlocked = managementBlocked
         self.accounts = accounts
         self.usage = usage
         self.activation = activation
@@ -1047,11 +1066,13 @@ public struct DeckState: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case accounts, usage, activation, scheduler, daemon, memberBlackout, modelDrop, sharedScope
+        case managed, managementBlocked, accounts, usage, activation, scheduler, daemon, memberBlackout, modelDrop, sharedScope
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.managed = (try? container.decodeIfPresent([String: Bool].self, forKey: .managed)) ?? nil
+        self.managementBlocked = (try? container.decodeIfPresent([String: String].self, forKey: .managementBlocked)) ?? nil
         self.accounts = try container.decodeIfPresent([DeckAccount].self, forKey: .accounts) ?? []
         self.usage = try container.decodeIfPresent([UsageSnapshot].self, forKey: .usage) ?? []
         self.activation = try? container.decodeIfPresent(DeckActivation.self, forKey: .activation)
@@ -1060,6 +1081,22 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.memberBlackout = try? container.decodeIfPresent(MemberBlackoutStatus.self, forKey: .memberBlackout)
         self.modelDrop = try? container.decodeIfPresent(ModelDropStatus.self, forKey: .modelDrop)
         self.sharedScope = try? container.decodeIfPresent(SharedScopeStatus.self, forKey: .sharedScope)
+    }
+
+    public func isManaged(_ provider: DeckProvider) -> Bool {
+        // An older daemon predates this choice and manages both providers.
+        managed == nil || managed?[provider.rawValue] == true
+    }
+
+    public func managementDisabledReason(for provider: DeckProvider) -> String? {
+        if provider == .claude, isManaged(provider) {
+            return "Turning off account switching for Claude is not available yet. Your accounts and history are unchanged."
+        }
+        if let reason = managementBlocked?[provider.rawValue] { return reason }
+        if isManaged(provider), accounts.filter({ $0.provider == provider.rawValue }).count != 1 {
+            return "Keep one subscription to turn off switching."
+        }
+        return nil
     }
 
     /// Issue #185: true exactly when the daemon ADMITTED its executable no
@@ -1091,6 +1128,7 @@ public struct DeckState: Codable, Equatable, Sendable {
 /// owner-only profile home (native Claude profile home / CODEX_HOME) and
 /// returns it on the created account.
 public struct AccountCreate: Codable, Equatable, Sendable {
+    public var manageProvider: Bool?
     public var provider: String
     public var label: String
     public var purpose: String
@@ -1100,19 +1138,42 @@ public struct AccountCreate: Codable, Equatable, Sendable {
     /// creates nothing (decision 0035). Nil is omitted from the payload, so
     /// the Claude/Codex create is byte-identical to before.
     public var profileRef: String?
+    /// Issue #645: the explicit answer to a profile-exists refusal.
+    public var existingProfile: String?
 
     public init(
         provider: String,
         label: String,
         purpose: String,
         color: String? = nil,
-        profileRef: String? = nil
+        profileRef: String? = nil,
+        manageProvider: Bool? = nil,
+        existingProfile: String? = nil
     ) {
+        self.manageProvider = manageProvider
         self.provider = provider
         self.label = label
         self.purpose = purpose
         self.color = color
         self.profileRef = profileRef
+        self.existingProfile = existingProfile
+    }
+}
+
+/// Metadata only, returned before an existing profile is adopted.
+public struct ExistingProfileSummary: Codable, Equatable, Sendable {
+    public var path: String
+    public var name: String
+    public var transcripts: Int
+    public var lastModified: String
+    public var hasCredential: Bool?
+
+    public init(path: String, name: String, transcripts: Int, lastModified: String, hasCredential: Bool? = nil) {
+        self.path = path
+        self.name = name
+        self.transcripts = transcripts
+        self.lastModified = lastModified
+        self.hasCredential = hasCredential
     }
 }
 

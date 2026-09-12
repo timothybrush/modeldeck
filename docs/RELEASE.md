@@ -430,6 +430,11 @@ To refresh the screenshots for a release:
 
 ## Known gaps / future
 
+- Data removal is opt-in: deleting `<DATA_DIR>` removes managed Codex homes
+  in `codex-profiles/` and their migration recovery backups. Uninstalling the
+  app or LaunchAgent alone retains them. Custom profile-directory overrides
+  and the migration's empty `~/.codex-profiles` directory remain separate;
+  see the README uninstall instructions.
 - No custom app icon yet: there is no vector/raster brand asset in the
   repo (`design/` holds HTML mockups only), so the bundle ships without
   an `.icns` rather than inventing artwork.

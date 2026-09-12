@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pool alert: transient overload style (issue #572)</title>
+<style>
+  body { margin: 0; padding: 32px; background: #1e1e20; color: #e8e8ea;
+         font: 13px/1.5 -apple-system, "SF Pro Text", Helvetica, sans-serif; }
+  h1 { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
+  p.note { color: #9a9aa0; max-width: 560px; margin: 0 0 24px; }
+  .case { margin-bottom: 28px; }
+  .case h2 { font-size: 12px; font-weight: 600; color: #9a9aa0;
+             text-transform: uppercase; letter-spacing: .04em; margin: 0 0 8px; }
+  .deck { width: 380px; background: rgba(44,44,48,.92); border: 1px solid #3a3a3e;
+          border-radius: 12px; padding: 14px; box-shadow: 0 8px 30px rgba(0,0,0,.45); }
+  .banner { display: flex; align-items: baseline; gap: 8px; font-size: 11px; }
+  .banner .icon { width: 12px; text-align: center; }
+  .red { color: #ff6b5e; }
+  .quiet { color: #9a9aa0; }
+  .fix { margin-left: auto; color: #4da3ff; font-size: 11px; white-space: nowrap; }
+  .cards { margin-top: 12px; border-top: 1px solid #3a3a3e; padding-top: 10px;
+           color: #6a6a70; font-size: 11px; }
+  .meter { height: 6px; border-radius: 3px; background: #3a3a3e; margin: 6px 0 10px; overflow: hidden; }
+  .meter i { display: block; height: 100%; width: 62%; background: #d97757; }
+  .meter.b i { width: 38%; background: #5b8def; }
+  .tip { margin-top: 8px; font-size: 11px; color: #7a7a80; max-width: 380px; }
+  .tip b { color: #b9b9c0; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Pool alert, overload class (issue #572)</h1>
+<p class="note">Same banner slot at the top of the deck, same evidence line, no timer —
+only the style and the remedy change when the failure is the provider's overload
+(HTTP 529/5xx), not the credential. Auth failures (401/403) keep the red style below, unchanged.</p>
+
+<div class="case">
+  <h2>Before — what you saw for 23 hours</h2>
+  <div class="deck">
+    <div class="banner red">
+      <span class="icon">&#9940;</span>
+      <span>placeholder@example.invalid: last 4 requests failed (HTTP 529)</span>
+      <span class="fix">Fix sign-in</span>
+    </div>
+    <div class="cards">
+      placeholder@example.invalid &middot; Weekly &middot; all models
+      <div class="meter"><i></i></div>
+      Insight (Codex) &middot; Weekly
+      <div class="meter b"><i></i></div>
+    </div>
+  </div>
+  <div class="tip"><b>Tooltip said:</b> "…Sign in again to restore proxy routing." (wrong — 529 is Anthropic overloaded, the sign-in was fine)</div>
+</div>
+
+<div class="case">
+  <h2>After — soft style, honest remedy, no action offered</h2>
+  <div class="deck">
+    <div class="banner quiet">
+      <span class="icon">&#8635;</span>
+      <span>placeholder@example.invalid: last 4 requests failed (HTTP 529)</span>
+    </div>
+    <div class="cards">
+      placeholder@example.invalid &middot; Weekly &middot; all models
+      <div class="meter"><i></i></div>
+      Insight (Codex) &middot; Weekly
+      <div class="meter b"><i></i></div>
+    </div>
+  </div>
+  <div class="tip"><b>Tooltip says:</b> "…No action needed — the provider's servers were briefly overloaded; the next request through this subscription clears it."</div>
+</div>
+
+</body>
+</html>

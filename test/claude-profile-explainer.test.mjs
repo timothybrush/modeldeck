@@ -151,6 +151,7 @@ test('daemon startup reconciles every managed Claude profile, including disabled
   );
 
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => store.close());
   store.saveSettings({ autoRefreshEnabled: false });
   const first = store.saveAccount({ provider: 'claude', label: 'First', profileRef: firstProfile });
@@ -201,6 +202,7 @@ test('new Claude account creation installs the explainer before returning', asyn
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-profile-create-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => store.close());
   const service = new ModelDeckService(store, {
     claudeProfilesDir: path.join(root, 'claude-profiles'),
@@ -222,6 +224,7 @@ test('Claude account creation succeeds when explainer installation fails', async
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-profile-create-best-effort-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => store.close());
   const service = new ModelDeckService(store, {
     claudeProfilesDir: path.join(root, 'claude-profiles'),
@@ -246,6 +249,7 @@ test('caller-supplied Claude profile registration succeeds when explainer instal
   fs.mkdirSync(profileRef, { recursive: true, mode: 0o700 });
   fs.chmodSync(profilesDir, 0o700);
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => store.close());
   const service = new ModelDeckService(store, {
     claudeProfilesDir: profilesDir,
@@ -266,6 +270,7 @@ test('failed Claude account creation removes a fresh profile containing an expla
   const profilesDir = path.join(root, 'claude-profiles');
   let failedProfileRef;
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => store.close());
   const service = new ModelDeckService(store, {
     claudeProfilesDir: profilesDir,
@@ -296,6 +301,7 @@ test('Claude profile import validates duplicate registration before installing t
   fs.mkdirSync(profileRef, { recursive: true, mode: 0o700 });
   fs.chmodSync(profilesDir, 0o700);
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   t.after(() => store.close());
   store.saveAccount({ provider: 'claude', label: 'Existing', profileRef });
   let explainerCalls = 0;

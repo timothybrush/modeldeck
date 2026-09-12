@@ -37,10 +37,7 @@ private final class RecordingDriver: AppUpdateInstalling {
 }
 
 private func freshDefaults() -> UserDefaults {
-    let suite = "issue303-tests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suite)!
-    defaults.removePersistentDomain(forName: suite)
-    return defaults
+    ScratchDefaults.make("issue303-tests")
 }
 
 // MARK: - Pairing: staged status never renders without an action

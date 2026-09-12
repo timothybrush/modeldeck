@@ -21,10 +21,7 @@ private final class StubInstallDriver: AppUpdateInstalling {
 }
 
 private func freshDefaults() -> UserDefaults {
-    let suite = "install-update-tests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suite)!
-    defaults.removePersistentDomain(forName: suite)
-    return defaults
+    ScratchDefaults.make("install-update-tests")
 }
 
 @Suite("App update install model (issue #121)")

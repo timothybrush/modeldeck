@@ -162,6 +162,8 @@ export const ACCOUNT_COLORS = Object.freeze({
 });
 
 export const DEFAULT_SETTINGS = Object.freeze({
+  claudeManaged: null,
+  codexManaged: null,
   autoRefreshEnabled: true,
   // Issue #176: expired Claude OAuth credentials may be renewed through the
   // provider CLI after the normal scheduled refresh identifies them. This is
@@ -243,6 +245,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
 
 function validateSetting(key, value) {
   if (!Object.hasOwn(DEFAULT_SETTINGS, key)) throw new Error(`unknown setting: ${key}`);
+  if (['claudeManaged', 'codexManaged'].includes(key) && value !== null && typeof value !== 'boolean') {
+    throw new Error(`${key} must be a boolean or null`);
+  }
   if (['autoRefreshEnabled', 'autoRenewEnabled', 'otelReceiverEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive', 'sharedUserScopeEnabled', 'usageAnalyticsEnabled', 'usageQueueConsumerEnabled'].includes(key) && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean`);
   }
@@ -1657,10 +1662,18 @@ export class Store {
     if (!input.profileRef?.trim()) throw new Error('profile reference is required');
     let profileRef = input.profileRef.trim();
     if (input.provider === 'codex') {
-      const canonical = canonicalDirectory(profileRef, 'CODEX_HOME');
-      if (process.getuid && canonical.stat.uid !== process.getuid()) throw new Error('CODEX_HOME must be owned by the current user');
-      if ((canonical.stat.mode & 0o077) !== 0) throw new Error(`CODEX_HOME must use owner-only permissions (chmod 700 ${canonical.path})`);
-      profileRef = canonical.path;
+      const managed = this.getSettings().codexManaged === true;
+      // The service restricts unmanaged registrations to the real default home.
+      // A fresh login may not have created it yet; never mkdir or chmod it here.
+      if (managed || fs.existsSync(profileRef)) {
+        const canonical = canonicalDirectory(profileRef, 'CODEX_HOME');
+        if (process.getuid && canonical.stat.uid !== process.getuid()) throw new Error('CODEX_HOME must be owned by the current user');
+        if (managed && (canonical.stat.mode & 0o077) !== 0) throw new Error(`CODEX_HOME must use owner-only permissions (chmod 700 ${canonical.path})`);
+        profileRef = canonical.path;
+      } else {
+        if (!path.isAbsolute(profileRef)) throw new Error('CODEX_HOME must be an absolute path');
+        profileRef = path.resolve(profileRef);
+      }
       for (const account of this.listAccounts().filter((item) => item.provider === 'codex' && item.id !== input.id)) {
         if (profileRef === account.profileRef || profileRef.startsWith(`${account.profileRef}${path.sep}`) || account.profileRef.startsWith(`${profileRef}${path.sep}`)) {
           if (profileRef !== account.profileRef) throw new Error('CODEX_HOME profiles cannot be nested inside one another');
@@ -1693,6 +1706,25 @@ export class Store {
     );
     if (input.isDefault) this.setDefault(input.provider, id);
     return this.getAccount(id);
+  }
+
+  /// Publish a verified directory migration atomically, without changing any
+  /// other account fields. A stale account reference aborts the whole batch.
+  repointCodexProfiles(moves) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const update = this.db.prepare(`
+        UPDATE accounts SET profile_ref = ?
+        WHERE id = ? AND provider = 'codex' AND profile_ref = ?
+      `);
+      for (const { id, from, to } of moves) {
+        if (update.run(to, id, from).changes !== 1) throw new Error('Codex profile reference changed during migration');
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   setDefault(provider, id) {
@@ -4781,9 +4813,13 @@ export class Store {
     return settings;
   }
 
-  saveSettings(input) {
+  validateSettings(input) {
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('settings must be a JSON object');
     for (const [key, value] of Object.entries(input)) validateSetting(key, value);
+  }
+
+  saveSettings(input) {
+    this.validateSettings(input);
     const current = this.getSettings();
     const settings = { ...current, ...input };
     // Issue #90 change-event provenance. The flag is one-way: it turns true

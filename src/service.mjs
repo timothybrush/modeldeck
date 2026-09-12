@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
-import { activeLinkBlockedError } from './adapters/provider-profile.mjs';
+import { updateProviderShellHook } from './provider-shell-env.mjs';
+import { activeLinkBlockedError, moveLegacyHome, safeProfileName } from './adapters/provider-profile.mjs';
 import { execFile, spawn as spawnChild } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -25,6 +26,7 @@ import {
   claudeCredentialsPresent,
 } from './adapters/claude-keychain.mjs';
 import { reconcileClaudeProfileExplainer } from './adapters/claude-profile-explainer.mjs';
+import { reconcileSharedTranscripts, sharedTranscriptState } from './shared-transcripts.mjs';
 import {
   assertGrokHomeDirectory,
   fetchGrokUsage,
@@ -91,6 +93,8 @@ import { runDiagnostician as scanDiagnostician } from './diagnostician.mjs';
 import { refitUsageEstimates } from './usage-estimate.mjs';
 import { collectConfigLintSnapshot, configLintSnapshotOptions } from './config-linter-snapshot.mjs';
 import { configLintFailureFindings, evaluateConfigLint } from './config-linter.mjs';
+import { CODEX_PROFILES_DIR } from './paths.mjs';
+import { migrateCodexProfilesDir } from './codex-profiles-migration.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -117,6 +121,15 @@ export const CONFIG_LINT_INTERVAL_MS = DAY_MS;
 // same evidence bar without adding a clock or polling loop.
 export const MEMBER_BLACKOUT_FAILURE_THRESHOLD = 3;
 const MEMBER_BLACKOUT_REMEDY = 'Sign in again to restore proxy routing.';
+// Issue #572: an overload-class streak (5xx incl. Anthropic's 529, plus
+// timeout/rate-limit) is the provider's problem, not the credential's —
+// telling the user to sign in again is the wrong remedy, and the live
+// incident wore it for a day. Classified on the streak's latest status code.
+const MEMBER_BLACKOUT_TRANSIENT_REMEDY = 'No action needed because a successful request through this subscription clears the alert.';
+
+export function memberBlackoutTransientStatus(statusCode) {
+  return statusCode != null && ((statusCode >= 500 && statusCode <= 599) || statusCode === 408 || statusCode === 429);
+}
 
 /// Issue #539: the pool identities the proxy reports as `active` — a finished
 /// sign-in, not a refresh in progress. Keyed exactly like
@@ -560,6 +573,7 @@ const CLIENT_KEY_REPORT_MAX_ENTRIES = 1000;
 const CLIENT_KEY_REPORT_MAX_GENERATION = 1_000_000_000;
 export const CLIENT_KEY_REPORT_MAX_GENERATION_JUMP = 1_000_000;
 const SHA256_OF_EMPTY_STRING = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+const CLAUDE_UNMANAGE_UNAVAILABLE_REASON = 'Turning off account switching for Claude is not available yet. Your accounts and history are unchanged.';
 
 function serviceError(message, statusCode) {
   const error = new Error(message);
@@ -879,7 +893,21 @@ export class ModelDeckService {
     this.statuslineIngestTimer = null;
     this.codexPath = options.codexPath || 'codex';
     this.codexActiveLink = options.codexActiveLink || path.join(os.homedir(), '.codex');
-    this.codexProfilesDir = options.codexProfilesDir || path.join(os.homedir(), '.codex-profiles');
+    this.codexProfilesDir = options.codexProfilesDir || CODEX_PROFILES_DIR;
+    // Only the production composition root supplies the legacy home. Isolated
+    // services must never discover or migrate a developer's live credentials.
+    this.codexLegacyProfilesDir = options.codexLegacyProfilesDir || null;
+    this.codexMigrationOptions = options.codexMigrationOptions || {};
+    this.logCodexMigration = options.logCodexMigration || ((message) => console.error(`[modeldeck] ${message}`));
+    this.codexProfilesMigrationWarning = null;
+    this.codexProfilesMigrationBlocked = false;
+    this.codexProfilesMigrationPromise = null;
+    this.codexShellEnvFile = options.codexShellEnvFile || path.join(this.dataDir, 'codex-env.sh');
+    this.providerManagementOperations = new Set();
+    this.providerTakeovers = new Set();
+    this.codexActivationCount = 0;
+    this.moveLegacyHome = options.moveLegacyHome || moveLegacyHome;
+    this.initializeProviderManagement();
     // External Grok data is opt-in at this seam. The production composition
     // root passes GROK_SESSIONS_DIR; isolated service fixtures therefore cannot
     // fall through to the user's real ~/.grok store.
@@ -895,8 +923,17 @@ export class ModelDeckService {
     this.fetchClaude = options.fetchClaude || fetchClaudeUsage;
     this.fetchCodex = options.fetchCodex || fetchCodexRateLimits;
     this.fetchGrok = options.fetchGrok || fetchGrokUsage;
-    this.activateClaude = options.activateClaude || activateClaudeProfile;
+    this.activateClaude = (...args) => {
+      this.requireManaged('claude');
+      return (options.activateClaude || activateClaudeProfile)(...args);
+    };
+    this.sharedTranscriptWarnings = new Map();
+    this.sharedTranscriptTasks = new Map();
+    this.sharedTranscriptCounts = new Map();
     this.createClaudeProfile = options.createClaudeProfile || createClaudeProfileHome;
+    // A numbered fresh home can be another add's base name. Reserve the
+    // provider through creation and rollback so neither can adopt it early.
+    this.accountProfileCreations = new Set();
     this.ensureClaudeProfileExplainer = options.reconcileClaudeProfileExplainer
       || reconcileClaudeProfileExplainer;
     this.createCodexProfile = options.createCodexProfile || createCodexProfileHome;
@@ -1157,6 +1194,45 @@ export class ModelDeckService {
     await this.configLintPromise?.catch(() => {});
   }
 
+  migrateCodexProfilesDir() {
+    if (this.demoFixtures) return Promise.resolve();
+    this.codexProfilesMigrationTarget ??= this.codexProfilesDir;
+    this.codexProfilesMigrationPromise ??= migrateCodexProfilesDir({
+      ...this.codexMigrationOptions,
+      store: this.store, legacyDir: this.codexLegacyProfilesDir,
+      profilesDir: this.codexProfilesMigrationTarget, activeLink: this.codexActiveLink,
+      dataDir: this.dataDir, log: this.logCodexMigration,
+    }).then(async (result) => {
+      // A busy, untouched legacy install must remain usable. New accounts
+      // also stay there so they cannot fill the destination and defeat retry.
+      this.codexProfilesDir = result.profilesDir || this.codexProfilesMigrationTarget;
+      this.initializeProviderManagement();
+      // A deferred migration can leave a terminal pin on the legacy root.
+      // Retry after an already-completed migration too, if its pin write failed.
+      if (this.codexLegacyProfilesDir && !result.blocked && this.isProviderManaged('codex')) {
+        try {
+          const envStat = await fs.promises.lstat(this.codexShellEnvFile).catch((error) => {
+            if (error.code === 'ENOENT') return null;
+            throw error;
+          });
+          if (envStat) {
+            if (!envStat.isFile() || !fs.lstatSync(this.codexActiveLink).isSymbolicLink()) throw new Error('Unsafe Codex terminal pin');
+            const target = fs.realpathSync(this.codexActiveLink);
+            const account = this.store.listAccounts().find((item) => item.provider === 'codex' && path.resolve(item.profileRef) === target);
+            if (!account) throw new Error('Unregistered Codex terminal pin');
+            await this.writeCodexShellEnvFile(this.providerProfileRef(account));
+          }
+        } catch {
+          result = { ...result, blocked: true, warning: 'The Codex terminal environment could not be updated. Restart ModelDeck to retry.' };
+        }
+      }
+      this.codexProfilesMigrationWarning = result.warning || null;
+      this.codexProfilesMigrationBlocked = result.blocked === true;
+      return result;
+    });
+    return this.codexProfilesMigrationPromise;
+  }
+
   startAutoRefresh() {
     if (this.autoRefreshStarted) return;
     // Demo fixture mode: fixtures never refresh, so never arm the scheduler.
@@ -1168,6 +1244,7 @@ export class ModelDeckService {
     // explainer. Reconcile alongside the #190/#189 statusline startup repair
     // so upgrades to the pinned block reach profiles created by older builds.
     void this.trackAutoRefreshStartup(this.reconcileClaudeProfileExplainers()).catch(() => {});
+    void this.trackAutoRefreshStartup(this.reconcileActiveTranscripts()).catch(() => {});
     // Issue #189: before anything else statusline, repair tees still
     // pointing at a daemon binary that has since moved or been deleted
     // (same bug class as #185's dead release-worktree daemon).
@@ -1189,7 +1266,7 @@ export class ModelDeckService {
     this.startClaudeStatuslineWatcher();
     const generation = ++this.autoRefreshGeneration;
     const settings = this.store.getSettings();
-    if (settings.sharedUserScopeEnabled) {
+    if (settings.sharedUserScopeEnabled && this.isProviderManaged('claude')) {
       void this.trackAutoRefreshStartup(this.sharedScope.start()).catch(() => {
         // Provider paths can contain account labels; never echo them into the
         // daemon log from a filesystem exception.
@@ -1605,12 +1682,18 @@ export class ModelDeckService {
         ['transcriptArchive', () => this.ingestTranscriptArchive({
           store: this.store,
           directory: this.claudeProfilesDir,
-          extraRoots: this.store.getSettings().extraClaudeScanRoots,
+          extraRoots: [
+            ...this.store.getSettings().extraClaudeScanRoots,
+            ...(!this.isProviderManaged('claude') ? this.store.listAccounts().filter((account) => account.provider === 'claude')
+              .map((account) => ({ path: this.providerProfileRef(account), profileSlug: account.id })) : []),
+          ],
           machine: this.warehouseIngestMachine,
         })],
         ['codexRollouts', () => this.ingestCodexRollouts({
           store: this.store,
           profilesRoot: this.codexProfilesDir,
+          profileHomes: !this.isProviderManaged('codex') ? this.store.listAccounts().filter((account) => account.provider === 'codex')
+            .map((account) => ({ path: this.providerProfileRef(account), profileSlug: account.id })) : [],
           machine: this.warehouseIngestMachine,
         })],
         ...(this.grokSessionsDir ? [['grokSessions', () => this.ingestGrokSessions({
@@ -1675,6 +1758,7 @@ export class ModelDeckService {
   /// account id and filesystem diagnosis; profile document bytes are never
   /// returned or logged.
   async reconcileClaudeProfileExplainers() {
+    if (!this.isProviderManaged('claude')) return [];
     const reconciled = [];
     for (const account of this.store.listAccounts()) {
       if (account.provider !== 'claude') continue;
@@ -1982,6 +2066,7 @@ export class ModelDeckService {
   /// user's chained statusLine and the original pre-install backup survive.
   /// Per-account best effort — one unreadable profile never blocks the rest.
   async reconcileClaudeStatuslineInstalls() {
+    if (!this.isProviderManaged('claude')) return [];
     const repaired = [];
     for (const account of this.store.listAccounts()) {
       if (account.provider !== 'claude') continue;
@@ -2016,6 +2101,8 @@ export class ModelDeckService {
   /// idempotent (re-install refreshes paths without stacking tees or
   /// clobbering the original backup).
   async installClaudeStatusline(accountId) {
+    this.requireManaged('claude');
+    this.assertNoProviderManagement('claude');
     const account = this.store.getAccount(accountId);
     if (!account) throw new Error('account not found');
     if (account.provider !== 'claude') {
@@ -2104,6 +2191,8 @@ export class ModelDeckService {
   /// user already replaced our tee themselves. The capture file and backup
   /// are removed either way; stored snapshots stay (history is history).
   async uninstallClaudeStatusline(accountId) {
+    this.requireManaged('claude');
+    this.assertNoProviderManagement('claude');
     const account = this.store.getAccount(accountId);
     if (!account) throw new Error('account not found');
     if (account.provider !== 'claude') {
@@ -2172,6 +2261,7 @@ export class ModelDeckService {
   /// for a fresh file) — a statusline render sourcing settings mid-write
   /// must never see a torn document.
   async writeClaudeProfileSettings(settingsPath, content) {
+    this.requireManaged('claude');
     let mode = 0o600;
     try { mode = (await fs.promises.stat(settingsPath)).mode & 0o777; }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -2215,22 +2305,33 @@ export class ModelDeckService {
   // guard, filesystem transaction discipline, and persisted outcome; these
   // service methods keep the HTTP layer free of storage knowledge.
   enableSharedScope(options) {
+    this.requireManaged('claude');
+    this.assertNoProviderManagement('claude');
     return this.sharedScope.enable(options);
   }
 
   disableSharedScope(options) {
+    this.requireManaged('claude');
+    this.assertNoProviderManagement('claude');
     return this.sharedScope.disable(options);
   }
 
   applySharedScopeSettings(previous, settings) {
+    if (previous.sharedUserScopeEnabled !== settings.sharedUserScopeEnabled) {
+      this.requireManaged('claude');
+      this.assertNoProviderManagement('claude');
+    }
     return this.sharedScope.applySettings(previous, settings);
   }
 
   reconcileSharedScope(options) {
+    this.requireManaged('claude');
+    this.assertNoProviderManagement('claude');
     return this.sharedScope.reconcile(options);
   }
 
   async accountProfileSetChanged() {
+    if (!this.isProviderManaged('claude') || this.providerTakeovers.has('claude')) return;
     try { return await this.sharedScope.profileSetChanged(); }
     catch (error) {
       if (error?.statusCode !== 409) throw error;
@@ -2239,6 +2340,7 @@ export class ModelDeckService {
   }
 
   async accountDetachProfile(account) {
+    if (!this.isProviderManaged(account?.provider)) return;
     try { return await this.sharedScope.detachProfile(account); }
     catch (error) {
       if (error?.statusCode !== 409) throw error;
@@ -2429,7 +2531,9 @@ export class ModelDeckService {
     const results = await Promise.all(accounts.map(async (account) => {
       await this.refreshClaudeProfileMetadata(account).catch(() => {});
       try {
-        const snapshots = await this.fetchClaude({ claudeConfigDir: account.profileRef, profilesDir: this.claudeProfilesDir });
+        this.requireClaudeHomeVerified(account);
+        const snapshots = await this.fetchClaude({ claudeConfigDir: account.profileRef, ...this.providerReadOptions(account) });
+        this.requireClaudeHomeVerified(account);
         this.rememberClaudeCredentialExpiry(account.id, snapshots);
         for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
         refreshedSnapshots.set(account.id, snapshots);
@@ -2480,10 +2584,12 @@ export class ModelDeckService {
     let result;
     const refreshedSnapshots = new Map();
     try {
+      this.requireClaudeHomeVerified(account);
       const snapshots = await this.fetchClaude({
         claudeConfigDir: account.profileRef,
-        profilesDir: this.claudeProfilesDir,
+        ...this.providerReadOptions(account),
       });
+      this.requireClaudeHomeVerified(account);
       this.rememberClaudeCredentialExpiry(account.id, snapshots);
       for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
       refreshedSnapshots.set(account.id, snapshots);
@@ -2522,7 +2628,8 @@ export class ModelDeckService {
     ]);
     // Rebase on the freshest record after the awaits: a reset-identity that
     // landed mid-read must not be undone by saving a pre-reset snapshot.
-    const latest = this.store.getAccount(account.id) ?? account;
+    const latest = this.store.getAccount(account.id);
+    if (!latest || latest.profileRef !== account.profileRef) return latest ?? account;
     const metadata = { ...latest.metadata };
     const currentPlan = metadata.claudePlan || {};
     if (rateLimitTier) metadata.claudePlan = {
@@ -2549,12 +2656,12 @@ export class ModelDeckService {
     const authored = [];
     if (rateLimitTier) authored.push('claudePlan');
     if (identitySource) authored.push('claudeAccountUuid', 'identitySource');
+    const current = this.store.getAccount(account.id);
+    if (!current || current.profileRef !== account.profileRef) return current ?? account;
     const rebased = this.mergeDaemonMetadataAtPersist(latest.id, metadata, authored);
     if (identity === latest.identity && JSON.stringify(rebased) === JSON.stringify(latest.metadata)) return latest;
     return this.store.saveAccount({
-      id: latest.id, provider: latest.provider, label: latest.label,
-      profileRef: latest.profileRef, identity, color: latest.color,
-      enabled: latest.enabled, metadata: rebased,
+      ...current, identity, metadata: rebased,
     });
   }
 
@@ -2599,6 +2706,7 @@ export class ModelDeckService {
   }
 
   async importClaudeSwapProfiles(selections) {
+    this.requireManaged('claude');
     const imported = await this.migrateClaude({ selections, profilesDir: this.claudeProfilesDir });
     const saved = [];
     try {
@@ -2619,6 +2727,7 @@ export class ModelDeckService {
         saved.push(account);
       }
       await this.accountProfileSetChanged();
+      for (const account of saved) await this.reconcileCreatedProfileTranscripts(account);
       return saved;
     } catch (error) {
       for (const account of saved) this.store.deleteAccount(account.id);
@@ -2687,6 +2796,8 @@ export class ModelDeckService {
   }
 
   async adoptClaudeLegacyHome(accountId, { mode = 'adopt' } = {}) {
+    this.requireManaged('claude');
+    this.assertNoProviderManagement('claude');
     if (mode !== 'adopt' && mode !== 'fresh') {
       const error = new Error(`unknown legacy adoption mode: ${mode}`);
       error.statusCode = 400;
@@ -2700,8 +2811,9 @@ export class ModelDeckService {
       throw error;
     }
     this.beginClaudeActivation(accountId);
+    let adopted;
     try {
-      return await this.withClaudeActivationLock(async () => {
+      adopted = await this.withClaudeActivationLock(async () => {
         const latest = this.store.getAccount(accountId);
         if (!latest) throw new Error('account not found');
         if (!latest.enabled) throw new Error('account is disabled');
@@ -2829,7 +2941,7 @@ export class ModelDeckService {
         if (await fs.promises.lstat(backupPath).then(() => true, () => false)) {
           throw new Error(`legacy Claude backup destination already exists: ${backupPath}`);
         }
-        await fs.promises.rename(this.claudeActiveLink, backupPath);
+        await this.moveLegacyHome(this.claudeActiveLink, backupPath);
         try {
           await this.activateClaude({ profileRef: latest.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
         } catch (error) {
@@ -2839,7 +2951,7 @@ export class ModelDeckService {
           // user's real home is sitting at the backup path and the error is
           // the only place that can say so.
           try {
-            await fs.promises.rename(backupPath, this.claudeActiveLink);
+            await this.moveLegacyHome(backupPath, this.claudeActiveLink);
           } catch {
             throw new Error(
               `${errorMessage(error)} — your previous Claude setup is preserved at ${backupPath}; `
@@ -2870,7 +2982,7 @@ export class ModelDeckService {
           let filesystemRestored = true;
           try {
             await fs.promises.unlink(this.claudeActiveLink);
-            await fs.promises.rename(backupPath, this.claudeActiveLink);
+            await this.moveLegacyHome(backupPath, this.claudeActiveLink);
           } catch {
             filesystemRestored = false;
           }
@@ -2893,6 +3005,8 @@ export class ModelDeckService {
     } finally {
       this.endClaudeActivation(accountId);
     }
+    adopted.warnings.push(...await this.reconcileAccountTranscripts(adopted.account));
+    return adopted;
   }
 
   // First-run trap seen in the field: with no provider CLI installed, step 1
@@ -2916,44 +3030,441 @@ export class ModelDeckService {
     }
   }
 
-  async createClaudeAccount({ label, identity, purpose = '', color, isDefault = false } = {}) {
+  initializeProviderManagement() {
+    for (const provider of ['claude', 'codex']) {
+      if (this.store.getSettings()[`${provider}Managed`] !== null) continue;
+      const home = this[`${provider}ActiveLink`];
+      try {
+        if (!fs.lstatSync(home).isSymbolicLink()) continue;
+        const root = fs.realpathSync(this[`${provider}ProfilesDir`]);
+        const target = fs.realpathSync(home);
+        const relative = path.relative(root, target);
+        if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+          this.store.saveSettings({ [`${provider}Managed`]: true });
+        }
+      } catch { /* Unknown ownership never grants permission to manage a home. */ }
+    }
+  }
+
+  isProviderManaged(provider) {
+    return this.store.getSettings()[`${provider}Managed`] === true;
+  }
+
+  requireManaged(provider) {
+    if (!this.isProviderManaged(provider)) {
+      throw Object.assign(new Error(`ModelDeck does not manage ~/.${provider}. Turn on Manage account switching in Settings first.`), {
+        code: 'not-managed', statusCode: 409,
+      });
+    }
+  }
+
+  providerProfileRef(account) {
+    if (this.isProviderManaged(account.provider)) {
+      return managedProfile(account.profileRef, this[`${account.provider}ProfilesDir`], account.provider);
+    }
+    const home = this[`${account.provider}ActiveLink`];
+    let canonicalHome = path.resolve(home);
+    try {
+      if (!fs.lstatSync(home).isDirectory()) throw new Error('The provider home must be a real directory.');
+      canonicalHome = fs.realpathSync(home);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const reference = fs.existsSync(account.profileRef) ? fs.realpathSync(account.profileRef) : path.resolve(account.profileRef);
+    if (reference !== canonicalHome) {
+      throw Object.assign(new Error('This account does not use the provider’s home folder.'), { code: 'not-managed', statusCode: 409 });
+    }
+    return canonicalHome;
+  }
+
+  providerReadOptions(account) {
+    if (!this.isProviderManaged(account.provider)) this.providerProfileRef(account);
+    return this.isProviderManaged(account.provider)
+      ? { profilesDir: this[`${account.provider}ProfilesDir`] }
+      : { unmanagedHome: this[`${account.provider}ActiveLink`] };
+  }
+
+  requireClaudeHomeVerified(account) {
+    this.assertNoProviderManagement('claude');
+    if (this.store.getAccount(account.id)?.metadata?.claudeHomeNeedsVerification) {
+      throw new Error('The Claude folder moved. Check this subscription’s sign-in before reading usage; sign in explicitly before refreshing.');
+    }
+  }
+
+  // A folder move changes Claude's macOS Keychain namespace. The provider's
+  // own sign-in verification must establish identity in the destination.
+  accountAfterHomeMove(account, profileRef) {
+    return { ...account, profileRef, metadata: {
+      ...account.metadata,
+      ...(account.provider === 'claude' && this.platform === 'darwin' ? { claudeHomeNeedsVerification: true } : {}),
+    } };
+  }
+
+  assertNoProviderManagement(provider) {
+    if (this.providerTakeovers.has(provider)) {
+      throw Object.assign(new Error('Account switching is being changed. Please wait for it to finish.'), { code: 'management-in-progress', statusCode: 409 });
+    }
+  }
+
+  assertProviderIdle(provider) {
+    if (this.providerManagementOperations.has(provider) || this.providerTakeovers.size > 0
+        || (provider === 'codex' && this.codexActivationCount > 0)
+        || (provider === 'claude' && (this.claudeRenewalPromise || this.claudeActivationAccountCounts.size
+          || this.claudeActivationSafetyFence || this.claudeProfileSettingsTails.size || this.sharedScope.operation))) {
+      throw Object.assign(new Error('Account work is in progress. Please wait for it to finish.'), { code: 'management-in-progress', statusCode: 409 });
+    }
+  }
+
+  async captureProviderEnvironment(provider) {
+    const files = {};
+    for (const file of [this[`${provider}ShellEnvFile`], this.configLintZshenvPath]) {
+      try {
+        const stat = await fs.promises.lstat(file);
+        if (!stat.isFile()) throw new Error('The terminal environment must be a real file.');
+        files[file] = { bytes: await fs.promises.readFile(file), mode: stat.mode & 0o777 };
+      } catch (error) { if (error.code !== 'ENOENT') throw error; files[file] = null; }
+    }
+    const pins = provider === 'claude' ? await this.captureClaudeScopePins() : null;
+    if (pins && (pins.shellPin === undefined || Object.values(pins.launchd ?? {}).some((value) => value === undefined))) {
+      throw new Error('The existing terminal environment could not be read. Account switching was not changed.');
+    }
+    return { files, pins };
+  }
+
+  async restoreProviderEnvironment(provider, captured) {
+    this.requireManaged(provider);
+    for (const [file, original] of Object.entries(captured.files)) {
+      if (original === null) await fs.promises.rm(file, { force: true });
+      else {
+        const temporary = `${file}.modeldeck-${crypto.randomUUID()}`;
+        try {
+          await fs.promises.writeFile(temporary, original.bytes, { mode: 0o600, flag: 'wx' });
+          await fs.promises.chmod(temporary, original.mode);
+          await fs.promises.rename(temporary, file);
+        } finally { await fs.promises.rm(temporary, { force: true }); }
+      }
+    }
+    // The file snapshot above already restored the shell pin, including its mode.
+    if (captured.pins) await this.restoreClaudeScopePins({ ...captured.pins, shellPin: undefined });
+  }
+
+  // Hold the provider reservation until both filesystem and record rollback finish.
+  async takeOverProvider(provider, continuation = async () => undefined) {
+    const accounts = this.store.listAccounts().filter((account) => account.provider === provider);
+    if (accounts.length > 1) throw Object.assign(new Error('Keep one registered account before enabling account switching.'), { statusCode: 409 });
+    if (!accounts.length) {
+      const previous = this.store.getSettings()[`${provider}Managed`];
+      this.store.saveSettings({ [`${provider}Managed`]: true });
+      try { return await continuation(); }
+      catch (error) { this.store.saveSettings({ [`${provider}Managed`]: previous }); throw error; }
+    }
+    const account = accounts[0];
+    this.providerProfileRef(account);
+    const home = this[`${provider}ActiveLink`];
+    const previous = this.store.getSettings()[`${provider}Managed`];
+    const environment = await this.captureProviderEnvironment(provider);
+    let profileRef;
+    let moved = false;
+    let originalMode;
+    let linked = false;
+    this.providerTakeovers.add(provider);
+    this.store.saveSettings({ [`${provider}Managed`]: true });
+    try {
+      profileRef = await (provider === 'claude' ? this.createClaudeProfile : this.createCodexProfile)({
+        profilesDir: this[`${provider}ProfilesDir`], profileName: account.label,
+      });
+      let exists = true;
+      try { await fs.promises.lstat(home); } catch (error) { if (error.code !== 'ENOENT') throw error; exists = false; }
+      if (exists) {
+        originalMode = (await fs.promises.lstat(home)).mode & 0o777;
+        await fs.promises.rmdir(profileRef);
+        await this.moveLegacyHome(home, profileRef);
+        moved = true;
+        await fs.promises.chmod(profileRef, 0o700);
+      }
+      if (provider === 'claude') await this.activateClaude({ profileRef, activeLink: home, profilesDir: this.claudeProfilesDir });
+      else await this.activateCodexProfile(profileRef);
+      linked = true;
+      this.store.saveAccount({ ...this.accountAfterHomeMove(account, profileRef), isDefault: true });
+      if (provider === 'claude') {
+        const pins = await this.scopeClaudeSecureStorage(profileRef);
+        if (pins.error) throw new Error(pins.error);
+      } else await this.writeCodexShellEnvFile(profileRef);
+      await this.installProviderShellHook(provider);
+      return await continuation();
+    } catch (error) {
+      try {
+        const currentLink = await fs.promises.lstat(home).catch((statError) => { if (statError.code !== 'ENOENT') throw statError; return null; });
+        if (linked || currentLink?.isSymbolicLink()) {
+          if (!currentLink?.isSymbolicLink() || fs.realpathSync(home) !== profileRef) throw new Error('The provider home changed during setup.');
+          await fs.promises.unlink(home);
+        }
+        if (moved) {
+          await this.moveLegacyHome(profileRef, home);
+          await fs.promises.chmod(home, originalMode);
+        }
+        else if (profileRef) await fs.promises.rmdir(profileRef).catch((cleanupError) => { if (cleanupError.code !== 'ENOENT') throw cleanupError; });
+        await this.restoreProviderEnvironment(provider, environment);
+        this.store.saveSettings({ [`${provider}Managed`]: previous });
+        this.store.saveAccount(account);
+      } catch (rollbackError) {
+        throw new Error(`Account switching could not be restored. Your files are preserved at ${moved ? profileRef : home}. ${rollbackError.message}`, { cause: error });
+      }
+      throw error;
+    } finally { this.providerTakeovers.delete(provider); }
+  }
+
+  async releaseProviderHome(provider) {
+    this.requireManaged(provider);
+    if (provider === 'claude') {
+      throw Object.assign(serviceError(CLAUDE_UNMANAGE_UNAVAILABLE_REASON, 409), { code: 'claude-unmanage-unavailable' });
+    }
+    const accounts = this.store.listAccounts().filter((account) => account.provider === provider);
+    if (accounts.length !== 1) throw Object.assign(new Error('Keep exactly one account to turn off account switching.'), { statusCode: 409 });
+    const account = accounts[0];
+    const profileRef = this.providerProfileRef(account);
+    const home = this[`${provider}ActiveLink`];
+    if (!fs.lstatSync(home).isSymbolicLink() || fs.realpathSync(home) !== profileRef) {
+      throw Object.assign(new Error('Activate the remaining account before turning off account switching.'), { statusCode: 409 });
+    }
+    const environment = await this.captureProviderEnvironment(provider);
+    let unlinked = false;
+    let moved = false;
+    try {
+      await fs.promises.unlink(home);
+      unlinked = true;
+      await this.moveLegacyHome(profileRef, home);
+      moved = true;
+      await updateProviderShellHook({ target: this.configLintZshenvPath, provider, remove: true });
+      await fs.promises.rm(this[`${provider}ShellEnvFile`], { force: true });
+      if (provider === 'claude') {
+        const launchd = environment.pins.launchd && Object.fromEntries(Object.keys(environment.pins.launchd).map((key) => [key, null]));
+        await this.restoreClaudeScopePins({ shellPin: null, secureStorage: { value: null, status: 'inactive' }, launchd });
+      }
+      this.store.saveAccount(this.accountAfterHomeMove(account, home));
+      this.store.saveSettings({ [`${provider}Managed`]: false });
+    } catch (error) {
+      try {
+        if (moved) await this.moveLegacyHome(home, profileRef);
+        if (unlinked) await fs.promises.symlink(profileRef, home, 'dir');
+        await this.restoreProviderEnvironment(provider, environment);
+        this.store.saveAccount(account);
+      } catch (rollbackError) {
+        throw new Error(`Account switching could not be restored. Your files remain at ${moved ? home : profileRef}. ${rollbackError.message}`, { cause: error });
+      }
+      throw error;
+    }
+  }
+
+  async updateSettings(input) {
+    // Validate the whole document before starting any filesystem operation.
+    this.store.validateSettings(input);
+    const previous = this.store.getSettings();
+    if (previous.claudeManaged === true && input.claudeManaged === false) {
+      throw Object.assign(serviceError(CLAUDE_UNMANAGE_UNAVAILABLE_REASON, 409), { code: 'claude-unmanage-unavailable' });
+    }
+    const changes = ['claude', 'codex'].filter((provider) => Object.hasOwn(input, `${provider}Managed`)
+      && input[`${provider}Managed`] !== previous[`${provider}Managed`]);
+    const differs = (key) => JSON.stringify(input[key]) !== JSON.stringify(previous[key]);
+    if (changes.length && Object.keys(input).some((key) => !key.endsWith('Managed') && differs(key))) {
+      throw Object.assign(new Error('Change account switching separately from other settings.'), { statusCode: 400 });
+    }
+    if (changes.length > 1) throw Object.assign(new Error('Change account switching for one provider at a time.'), { statusCode: 400 });
+    for (const provider of changes) {
+      const value = input[`${provider}Managed`];
+      if (provider === 'claude' && previous.sharedUserScopeEnabled) {
+        throw Object.assign(new Error('Turn off shared Claude settings before changing account switching.'), { statusCode: 409 });
+      }
+      if (value === null) throw Object.assign(new Error('Choose whether ModelDeck manages account switching.'), { statusCode: 400 });
+      this.assertProviderIdle(provider);
+      this.providerManagementOperations.add(provider);
+      this.providerTakeovers.add(provider);
+      try {
+        if (value === true) await this.takeOverProvider(provider);
+        else if (this.isProviderManaged(provider)) await this.releaseProviderHome(provider);
+      } finally {
+        this.providerManagementOperations.delete(provider);
+        this.providerTakeovers.delete(provider);
+      }
+    }
+    return this.store.saveSettings(input);
+  }
+
+  async createClaudeAccount(input = {}) {
+    return this.createProviderAccount('claude', input);
+  }
+
+  async createCodexAccount(input = {}) {
+    return this.createProviderAccount('codex', input);
+  }
+
+  async createProviderAccount(provider, input) {
+    if (!input.label?.trim()) throw new Error('account label is required');
+    this.assertNoProviderManagement(provider);
+    if (this.accountProfileCreations.has(provider)) throw serviceError('Another account is being added. Try again in a moment.', 409);
+    if (!this.isProviderManaged(provider) && input.manageProvider === true) this.assertProviderIdle(provider);
+    if (this.providerManagementOperations.has(provider)) this.assertProviderIdle(provider);
+    this.providerManagementOperations.add(provider);
+    try {
+      if (!this.isProviderManaged(provider)) {
+        const accounts = this.store.listAccounts().filter((account) => account.provider === provider);
+        if (accounts.length) {
+          if (input.manageProvider !== true) {
+            throw Object.assign(new Error(`Switching between accounts needs ModelDeck to manage ~/.${provider}.`), { code: 'manage-required', statusCode: 409 });
+          }
+          this.providerTakeovers.add(provider);
+          return await this.takeOverProvider(provider, () => this.createManagedProviderAccount(provider, input));
+        }
+        await this.requireProviderCli(provider);
+        const profileRef = this.providerProfileRef({ provider, profileRef: this[`${provider}ActiveLink`] });
+        return this.store.saveAccount({ provider, label: input.label, identity: input.identity, purpose: input.purpose, color: input.color, profileRef, isDefault: true });
+      }
+      return await this.createManagedProviderAccount(provider, input);
+    } finally {
+      this.providerManagementOperations.delete(provider);
+      this.providerTakeovers.delete(provider);
+    }
+  }
+
+  createManagedProviderAccount(provider, input) {
+    return provider === 'claude' ? this.createManagedClaudeAccount(input) : this.createManagedCodexAccount(input);
+  }
+
+  profileIsRegistered(profileRef) {
+    let target;
+    try { target = fs.statSync(profileRef); } catch {}
+    return this.store.listAccounts().some((account) => {
+      if (!account.profileRef) return false;
+      if (path.resolve(account.profileRef) === profileRef) return true;
+      if (!target) return false;
+      try {
+        const registered = fs.statSync(account.profileRef);
+        return registered.dev === target.dev && registered.ino === target.ino;
+      } catch { return false; }
+    });
+  }
+
+  // Inspect only the derived base name, without opening any user files.
+  // An explicit choice is required before an orphan is reused or bypassed.
+  async accountProfileForCreation(provider, label, existingProfile) {
+    if (existingProfile !== undefined && !['adopt', 'fresh'].includes(existingProfile)) {
+      throw serviceError('existingProfile must be adopt or fresh', 400);
+    }
+    const profilesDir = provider === 'claude' ? this.claudeProfilesDir : this.codexProfilesDir;
+    const root = await fs.promises.realpath(profilesDir).catch((error) => {
+      if (error.code === 'ENOENT') return path.resolve(profilesDir);
+      throw error;
+    });
+    const name = safeProfileName(label);
+    const existingPath = path.join(root, name);
+    const stat = await fs.promises.lstat(existingPath).catch((error) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    const registered = this.profileIsRegistered(existingPath);
+    if (existingProfile === 'adopt') {
+      if (registered) throw serviceError('This profile is already used by another account.', 409);
+      if (!stat?.isDirectory()) throw serviceError('The existing profile must be a real directory.', 400);
+      if (process.getuid && stat.uid !== process.getuid()) {
+        throw serviceError('The existing profile must be owned by the current user.', 400);
+      }
+      const entries = await fs.promises.readdir(existingPath, { withFileTypes: true });
+      if (entries.some((entry) => entry.isSymbolicLink())) {
+        throw serviceError('The existing profile contains a symbolic link. Choose Start fresh instead.', 400);
+      }
+      await fs.promises.chmod(existingPath, 0o700);
+      return { profileRef: existingPath, adopted: true };
+    }
+    if (stat && !registered && existingProfile !== 'fresh') {
+      // Best-effort summary for the prompt: a directory the daemon cannot read
+      // is skipped rather than failing the whole choice, and the walk stops at
+      // a bound so a huge projects tree cannot stall the add (CodeRabbit #649).
+      let transcripts = 0;
+      let visited = 0;
+      const countTranscripts = async (directory) => {
+        if (visited >= 2000) return;
+        visited += 1;
+        const directoryStat = await fs.promises.lstat(directory).catch(() => null);
+        if (!directoryStat?.isDirectory()) return;
+        const entries = await fs.promises.readdir(directory, { withFileTypes: true }).catch(() => []);
+        for (const entry of entries) {
+          if (entry.isDirectory()) await countTranscripts(path.join(directory, entry.name));
+          else if (entry.isFile() && entry.name.endsWith('.jsonl')) transcripts += 1;
+        }
+      };
+      if (provider === 'claude' && stat.isDirectory()) await countTranscripts(path.join(existingPath, 'projects'));
+      const error = serviceError(`A profile named ${name} already exists. Adopt it or start fresh.`, 409);
+      error.code = 'profile-exists';
+      error.profile = { path: existingPath, name, transcripts, lastModified: stat.mtime.toISOString() };
+      if (provider === 'codex') {
+        error.profile.hasCredential = stat.isDirectory() && await fs.promises.lstat(path.join(existingPath, 'auth.json'))
+          .then((authStat) => authStat.isFile(), (error) => { if (error.code === 'ENOENT') return false; throw error; });
+      }
+      throw error;
+    }
+    const create = provider === 'claude' ? this.createClaudeProfile : this.createCodexProfile;
+    const profileRef = await create({ profilesDir, profileName: label });
+    const profileNote = stat && existingProfile === 'fresh'
+      ? `Created a new profile at ${profileRef}. The old folder was left at ${existingPath}.`
+      : undefined;
+    return { profileRef, adopted: false, profileNote };
+  }
+
+  async createManagedClaudeAccount({ label, identity, purpose = '', color, isDefault = false, existingProfile } = {}) {
+    this.requireManaged('claude');
     if (!label?.trim()) throw new Error('account label is required');
     await this.requireProviderCli('claude');
-    const profileRef = await this.createClaudeProfile({ profilesDir: this.claudeProfilesDir, profileName: label });
+    if (this.accountProfileCreations.has('claude')) throw serviceError('Another account is being added. Try again in a moment.', 409);
+    this.accountProfileCreations.add('claude');
+    let profileRef, adopted, profileNote;
     let account;
     try {
+      ({ profileRef, adopted, profileNote } = await this.accountProfileForCreation('claude', label, existingProfile));
       try {
         await this.ensureClaudeProfileExplainer({ profileRef });
       } catch (error) {
         console.error(`[modeldeck] profile explainer install failed during Claude account creation: ${error?.message || error}`);
       }
+      // Recheck after filesystem awaits: two concurrent adopters cannot
+      // attach the same folder to different accounts.
+      if (adopted && this.profileIsRegistered(profileRef)) throw serviceError('This profile is already used by another account.', 409);
       account = this.store.saveAccount({ provider: 'claude', label, identity, purpose, color, profileRef });
       account = await this.refreshClaudeProfileMetadata(account);
       account = isDefault ? this.setDefaultAccount('claude', account.id) : account;
       await this.accountProfileSetChanged();
-      return account;
+      await this.reconcileCreatedProfileTranscripts(account);
+      return profileNote ? { ...account, profileNote } : account;
     } catch (error) {
       if (account) this.store.deleteAccount(account.id);
-      await fs.promises.rm(profileRef, { recursive: true, force: true }).catch(() => {});
+      if (profileRef && !adopted) await fs.promises.rm(profileRef, { recursive: true, force: true }).catch(() => {});
       throw error;
+    } finally {
+      this.accountProfileCreations.delete('claude');
     }
   }
 
   // Issue #8, step 1 mirror of createClaudeAccount: the app supplies
   // provider + label + purpose + color and ModelDeck creates the isolated
   // owner-only CODEX_HOME. Login stays with the provider (step 2).
-  async createCodexAccount({ label, identity, purpose = '', color, isDefault = false } = {}) {
+  async createManagedCodexAccount({ label, identity, purpose = '', color, isDefault = false, existingProfile } = {}) {
+    this.requireManaged('codex');
     if (!label?.trim()) throw new Error('account label is required');
     await this.requireProviderCli('codex');
-    const profileRef = await this.createCodexProfile({ profilesDir: this.codexProfilesDir, profileName: label });
+    if (this.accountProfileCreations.has('codex')) throw serviceError('Another account is being added. Try again in a moment.', 409);
+    this.accountProfileCreations.add('codex');
+    let profileRef, adopted, profileNote;
     let account;
     try {
+      ({ profileRef, adopted, profileNote } = await this.accountProfileForCreation('codex', label, existingProfile));
+      if (adopted && this.profileIsRegistered(profileRef)) throw serviceError('This profile is already used by another account.', 409);
       account = this.store.saveAccount({ provider: 'codex', label, identity, purpose, color, profileRef });
-      return isDefault ? this.setDefaultAccount('codex', account.id) : account;
+      account = isDefault ? this.setDefaultAccount('codex', account.id) : account;
+      await this.reconcileCreatedProfileTranscripts(account);
+      return profileNote ? { ...account, profileNote } : account;
     } catch (error) {
       if (account) this.store.deleteAccount(account.id);
-      await fs.promises.rmdir(profileRef).catch(() => {});
+      if (profileRef && !adopted) await fs.promises.rmdir(profileRef).catch(() => {});
       throw error;
+    } finally {
+      this.accountProfileCreations.delete('codex');
     }
   }
 
@@ -2970,7 +3481,7 @@ export class ModelDeckService {
   // equally dangerous in reverse: it would let an API client declare an
   // arbitrary helper "ours" and have ModelDeck overwrite or delete it. The
   // stored value therefore always wins over whatever the input carries.
-  static DAEMON_OWNED_METADATA = ['claudePlan', 'claudeAccountUuid', 'identitySource', 'claudeRenewal', 'codexPlan', 'migratedFromClaudeSwap', 'clientKeyHelper'];
+  static DAEMON_OWNED_METADATA = ['claudePlan', 'claudeAccountUuid', 'identitySource', 'claudeRenewal', 'codexPlan', 'migratedFromClaudeSwap', 'clientKeyHelper', 'claudeHomeNeedsVerification', 'sharedTranscriptLinks'];
 
   /// Must be applied at the PERSISTENCE POINT, not on entry to an async
   /// caller. It reads the stored row and returns the merged input
@@ -3009,6 +3520,11 @@ export class ModelDeckService {
   }
 
   preserveDaemonMetadata(input) {
+    if (input?.metadata && Object.hasOwn(input.metadata, 'sharedTranscriptLinks')) {
+      const metadata = { ...input.metadata };
+      delete metadata.sharedTranscriptLinks;
+      input = { ...input, metadata };
+    }
     if (!input?.id || input.metadata == null) return input;
     const existing = this.store.getAccount(input.id);
     if (!existing?.metadata) return input;
@@ -3126,6 +3642,19 @@ export class ModelDeckService {
   }
 
   async saveAccount(input) {
+    if (['claude', 'codex'].includes(input.provider)) {
+      const existing = input.id ? this.store.getAccount(input.id) : null;
+      if (!this.isProviderManaged(input.provider)) {
+        if (!existing) {
+          if (input.profileRef && path.resolve(input.profileRef) !== path.resolve(this[`${input.provider}ActiveLink`])) this.requireManaged(input.provider);
+          return this.createProviderAccount(input.provider, this.preserveDaemonMetadata(input));
+        }
+        this.assertNoProviderManagement(input.provider);
+        this.providerProfileRef({ ...existing, ...input });
+        return this.store.saveAccount(this.preserveDaemonMetadata({ ...existing, ...input, profileRef: existing.profileRef }));
+      }
+      this.assertNoProviderManagement(input.provider);
+    }
     // Every `store.saveAccount` below re-reads the daemon-owned keys
     // IMMEDIATELY before writing, so nothing that lands during the awaits in
     // between can be clobbered by a stale snapshot. The create paths get the
@@ -3137,6 +3666,7 @@ export class ModelDeckService {
       const profileRef = await validateCodexProfileHome({ profileRef: input.profileRef, profilesDir: this.codexProfilesDir });
       const account = this.store.saveAccount(this.preserveDaemonMetadata({ ...input, profileRef }));
       if (input.isDefault) this.invalidateToolProbe();
+      await this.reconcileCreatedProfileTranscripts(account);
       return account;
     }
     if (input.provider === 'grok') {
@@ -3164,6 +3694,7 @@ export class ModelDeckService {
     account = await this.refreshClaudeProfileMetadata(account);
     if (input.isDefault) this.invalidateToolProbe();
     await this.accountProfileSetChanged();
+    await this.reconcileCreatedProfileTranscripts(account);
     return account;
   }
 
@@ -3205,7 +3736,7 @@ export class ModelDeckService {
     if (!account) throw new Error('account not found');
     if (!account.enabled) throw new Error('account is disabled');
     if (account.provider === 'claude') {
-      const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+      const profileRef = this.providerProfileRef(account);
       // Issue #300: Terminal inherits the user's PATH, which may resolve a
       // different bare `claude` than the daemon probed. Resolve through the
       // daemon's PATH first, dereference the result, then use that exact file
@@ -3213,7 +3744,7 @@ export class ModelDeckService {
       const claudeExecutable = await this.realpath(
         await this.toolExecutablePath(this.claudePath),
       );
-      const flow = await this.claudeLoginFlow(claudeExecutable);
+      const flow = this.isProviderManaged('claude') ? await this.claudeLoginFlow(claudeExecutable) : 'config-dir';
       // Issue #596 detector, half 1: snapshot the default home's identity at
       // serve time so a signed-out verify can tell "a login landed in the
       // default home during this attempt" apart from long-standing unmanaged
@@ -3225,7 +3756,7 @@ export class ModelDeckService {
       // The PROMISE is stored, not the value: check-and-set stays atomic
       // (no await between them), so concurrent serves cannot both capture
       // and a later capture can never replace the first.
-      if (!this.claudeStrayLoginBaseline.has(account.id)) {
+      if (this.isProviderManaged('claude') && !this.claudeStrayLoginBaseline.has(account.id)) {
         this.claudeStrayLoginBaseline.set(account.id, this.claudeDefaultHomeIdentitySnapshot());
       }
       if (flow === 'activation') {
@@ -3273,7 +3804,7 @@ export class ModelDeckService {
         preview: `${CLAUDE_MANAGED_KEY_UNSET_FRAGMENT}; CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(claudeExecutable)} auth login`,
       };
     }
-    const profileRef = managedCodexProfile(account.profileRef, this.codexProfilesDir);
+    const profileRef = this.providerProfileRef(account);
     return {
       provider: 'codex',
       account,
@@ -3343,11 +3874,17 @@ export class ModelDeckService {
   async verifyAccount(accountId) {
     const account = this.store.getAccount(accountId);
     if (!account) throw new Error('account not found');
+    this.assertNoProviderManagement(account.provider);
     const result = account.provider === 'claude'
-      ? await this.readClaudeAuth({ claudePath: this.claudePath, claudeConfigDir: account.profileRef, profilesDir: this.claudeProfilesDir })
-      : await this.readCodexAuth({ binary: this.codexPath, codexHome: account.profileRef, profilesDir: this.codexProfilesDir });
+      // Public issue #2, second sighting: the login step resolved the CLI
+      // through the install-dir fallback, but this read-back spawned the
+      // bare name under the daemon's static PATH — so a native-installer
+      // claude in ~/.local/bin signed in fine and then "wasn't installed"
+      // at verify. Both steps must resolve the executable the same way.
+      ? await this.readClaudeAuth({ claudePath: await this.spawnableToolPath(this.claudePath), claudeConfigDir: account.profileRef, ...this.providerReadOptions(account) })
+      : await this.readCodexAuth({ binary: await this.spawnableToolPath(this.codexPath), codexHome: account.profileRef, ...this.providerReadOptions(account) });
     let verifyHint;
-    if (account.provider === 'claude' && !result.authenticated) {
+    if (account.provider === 'claude' && !result.authenticated && this.isProviderManaged('claude')) {
       // Issue #596: an unpinned shell writes the login identity to the
       // DEFAULT ~/.claude.json — a sibling of the active-profile symlink,
       // which the flip cannot steer. When the profile reads signed-out but
@@ -3372,6 +3909,13 @@ export class ModelDeckService {
         }
       }
     }
+    this.assertNoProviderManagement(account.provider);
+    const latest = this.store.getAccount(account.id);
+    if (!latest || latest.profileRef !== account.profileRef) {
+      throw Object.assign(new Error('The account folder changed during verification. Please verify again.'), {
+        code: 'management-in-progress', statusCode: 409,
+      });
+    }
     // Issue #99 fix direction 2 (the #65 blind spot's enforcement teeth):
     // compare the read-back identity against the intended account BEFORE
     // persisting anything. On mismatch, refuse: persisting would launder the
@@ -3393,12 +3937,16 @@ export class ModelDeckService {
         };
       }
     }
+    const confirmsMovedHome = latest.metadata?.claudeHomeNeedsVerification && result.authenticated;
+    if (confirmsMovedHome && !result.identity?.trim()) {
+      return { account: latest, authenticated: false, verifyHint: 'Claude did not identify this sign-in after the folder moved. Sign in to this subscription, then verify again.' };
+    }
     // Issue #596: a clean authenticated verify ends the login attempt this
     // account's baseline was tracking.
     if (account.provider === 'claude' && result.authenticated) {
       this.claudeStrayLoginBaseline.delete(account.id);
     }
-    let saved = account;
+    let saved = latest;
     // Issue #26: persist the plan facts the status read surfaced alongside
     // the identity — same call, no extra provider work.
     const claudePlan = account.provider === 'claude' && result.plan
@@ -3415,8 +3963,9 @@ export class ModelDeckService {
       || (account.provider === 'codex'
         && JSON.stringify(codexPlan) !== JSON.stringify(account.metadata?.codexPlan || null))
     );
-    if (identityChanged || planChanged) {
+    if (identityChanged || planChanged || confirmsMovedHome) {
       const metadata = { ...account.metadata };
+      if (confirmsMovedHome) delete metadata.claudeHomeNeedsVerification;
       if (claudePlan) metadata.claudePlan = claudePlan;
       if (account.provider === 'codex') {
         if (codexPlan) metadata.codexPlan = codexPlan;
@@ -3431,17 +3980,13 @@ export class ModelDeckService {
       // keys (security re-review of PR #532).
       const authored = account.provider === 'codex' ? ['codexPlan'] : [];
       if (claudePlan) authored.push('claudePlan');
+      if (confirmsMovedHome) authored.push('claudeHomeNeedsVerification');
       saved = this.store.saveAccount({
-        id: account.id,
-        provider: account.provider,
-        label: account.label,
-        profileRef: account.profileRef,
+        ...latest,
         identity: identityChanged ? result.identity : account.identity,
-        color: account.color,
-        enabled: account.enabled,
         metadata: this.mergeDaemonMetadataAtPersist(
           account.id,
-          planChanged ? metadata : account.metadata,
+          planChanged || confirmsMovedHome ? metadata : account.metadata,
           authored,
         ),
       });
@@ -3468,7 +4013,7 @@ export class ModelDeckService {
       await this.refreshCodexPlanTier(account).catch(() => {});
       await this.refreshCodexAccountIdentifier(account).catch(() => {});
       try {
-        const snapshots = await this.fetchCodex({ binary: this.codexPath, codexHome: account.profileRef });
+        const snapshots = await this.fetchCodex({ binary: this.codexPath, codexHome: account.profileRef, ...this.providerReadOptions(account) });
         for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
         return { accountId: account.id, ok: true, snapshotCount: snapshots.length };
       } catch (error) {
@@ -3534,21 +4079,20 @@ export class ModelDeckService {
   // pass. This does not alter refresh scheduling or the usage probe request.
   async refreshCodexPlanTier(account) {
     const plan = await this.readCodexPlan({ codexHome: account.profileRef });
+    const latest = this.store.getAccount(account.id);
+    if (!latest || latest.profileRef !== account.profileRef) return;
     const next = codexPlanMetadata(plan?.planType);
-    const current = account.metadata?.codexPlan || null;
+    const current = latest.metadata?.codexPlan || null;
     if (JSON.stringify(next) === JSON.stringify(current)) return;
-    const metadata = { ...account.metadata };
+    const metadata = { ...latest.metadata };
     if (next) metadata.codexPlan = next;
     else delete metadata.codexPlan;
+    // Rebase daemon-owned keys at the persistence point so a concurrent
+    // transcript reconcile cannot be erased by this stale snapshot.
+    const rebased = this.mergeDaemonMetadataAtPersist(account.id, metadata, ['codexPlan']);
     this.store.saveAccount({
-      id: account.id,
-      provider: account.provider,
-      label: account.label,
-      profileRef: account.profileRef,
-      identity: account.identity,
-      color: account.color,
-      enabled: account.enabled,
-      metadata,
+      ...latest,
+      metadata: rebased,
     });
   }
 
@@ -3710,6 +4254,7 @@ export class ModelDeckService {
   // write-then-rename would), the next renewal restores the link, so the
   // profile's own file can go one run stale but can never be clobbered.
   async claudeRenewalConfigDir(profileRef) {
+    if (!this.isProviderManaged('claude')) return this.providerProfileRef({ provider: 'claude', profileRef });
     try {
       const suffix = crypto.createHash('sha256').update(String(profileRef).normalize('NFC'))
         .digest('hex').slice(0, 12);
@@ -3791,7 +4336,11 @@ export class ModelDeckService {
       const override = await this.claudeAuthOverrideState(profileRef);
       if (override.proxyRouted) args = [...args, '--settings', CLAUDE_RENEWAL_SETTINGS_OVERRIDE];
     }
-    return this.exec(this.claudePath, args, {
+    // Public issue #2: renewal spawns the CLI from the daemon too. Like
+    // installedToolVersion, the bare name goes first and the install-dir
+    // fallback answers only an ENOENT — so a PATH-visible CLI spawns
+    // exactly once, and a native-installer one in ~/.local/bin still runs.
+    const spawn = (binary) => this.exec(binary, args, {
       // cwd stays the shared scratch ROOT, unchanged from before #263. Only
       // the env moves. Pointing cwd at the per-account config dir would have
       // made it a project path for the CLI (a second settings search location)
@@ -3802,6 +4351,14 @@ export class ModelDeckService {
       timeout: CLAUDE_RENEWAL_TIMEOUT_MS,
       maxBuffer: 1_000_000,
     });
+    try {
+      return await spawn(this.claudePath);
+    } catch (error) {
+      if (error?.code !== 'ENOENT' || path.isAbsolute(this.claudePath)) throw error;
+      const fallback = await this.toolPathFallback(this.claudePath);
+      if (!fallback) throw error;
+      return spawn(fallback);
+    }
   }
 
   // Issue #280: the renewal identity rung and the on-demand verifier must be
@@ -3867,7 +4424,7 @@ export class ModelDeckService {
     try {
       const snapshots = await this.fetchClaude({
         claudeConfigDir: account.profileRef,
-        profilesDir: this.claudeProfilesDir,
+        ...this.providerReadOptions(account),
       });
       const latestAccount = this.store.getAccount(account.id);
       if (!latestAccount
@@ -3907,6 +4464,7 @@ export class ModelDeckService {
   }
 
   async restoreClaudeActivation(previous) {
+    this.requireManaged('claude');
     if (previous.state === 'linked') {
       await this.activateClaude({
         profileRef: previous.profileRef,
@@ -3972,6 +4530,7 @@ export class ModelDeckService {
   }
 
   async performClaudeFlipRenewal(account, at) {
+    this.requireManaged('claude');
     let previous;
     let activated = false;
     let result = {
@@ -4105,11 +4664,13 @@ export class ModelDeckService {
       return decided('failed', null, 'ModelDeck could not confirm that Claude was idle, so renewal was not attempted.', { path: 'flip', identityDecline });
     }
 
+    this.requireManaged('claude');
     const result = await this.performClaudeFlipRenewal(latestAccount, at);
     return this.recordClaudeRenewalAttempt(accountId, { ...result, identityDecline });
   }
 
   async renewClaudeAccount(accountId) {
+    if (this.providerManagementOperations.has('claude')) this.assertProviderIdle('claude');
     if (this.claudeRenewalPromise) throw new ClaudeRenewalConflictError();
     const account = this.store.getAccount(accountId);
     if (account?.provider === 'claude'
@@ -4332,12 +4893,15 @@ export class ModelDeckService {
     const account = this.store.getAccount(id);
     if (!account) throw new Error('account not found');
     if (!account.enabled) throw new Error('account is disabled');
+    this.requireManaged(account.provider);
+    this.assertNoProviderManagement(account.provider);
 
     let warnings = [];
     if (account.provider === 'claude') {
       this.beginClaudeActivation(id);
+      let activated;
       try {
-        return await this.withClaudeActivationLock(async () => {
+        activated = await this.withClaudeActivationLock(async () => {
           // Re-read after waiting: a queued activation must not revive a deleted
           // or newly disabled account.
           const latest = this.store.getAccount(id);
@@ -4356,12 +4920,109 @@ export class ModelDeckService {
       } finally {
         this.endClaudeActivation(id);
       }
+      activated.warnings.push(...await this.reconcileAccountTranscripts(activated.account));
+      return activated;
     } else {
       if (!this.codexActiveLink) throw new Error('Codex active profile link is not configured');
-      await this.activateCodexProfile(account.profileRef);
+      this.codexActivationCount += 1;
+      try {
+        await this.activateCodexProfile(account.profileRef);
+        const activated = this.setDefaultAccount(account.provider, account.id);
+        warnings.push(...await this.reconcileAccountTranscripts(activated));
+        return { account: activated, warnings };
+      } finally { this.codexActivationCount -= 1; }
     }
+  }
 
-    return { account: this.setDefaultAccount(account.provider, account.id), warnings };
+  async reconcileAccountTranscripts(account) {
+    // Only Claude and Codex resume by transcript path (CodeRabbit #652: a
+    // Grok activation would otherwise cache an unsafe-path warning forever).
+    if (account.provider !== 'claude' && account.provider !== 'codex') return [];
+    // Older Codex registrations can point outside the managed directory.
+    // They still activate, but sharing must never traverse those homes.
+    if (account.provider === 'codex') {
+      try {
+        if (fs.realpathSync(path.dirname(account.profileRef)) !== fs.realpathSync(this.codexProfilesDir)) return [];
+      } catch { return []; }
+    }
+    const previous = this.sharedTranscriptTasks.get(account.profileRef) || Promise.resolve();
+    const task = previous.catch(() => {}).then(async () => {
+      const latest = this.store.getAccount(account.id);
+      if (!latest || latest.profileRef !== account.profileRef) return [];
+      const result = await reconcileSharedTranscripts({
+        profilesDir: account.provider === 'claude' ? this.claudeProfilesDir : this.codexProfilesDir,
+        profileRef: account.profileRef, provider: account.provider,
+        ownedLinks: latest.metadata?.sharedTranscriptLinks,
+      });
+      const current = this.store.getAccount(account.id);
+      if (result.ownedLinks && current?.profileRef === account.profileRef) {
+        try {
+          this.store.saveAccount({ ...current, metadata: {
+            ...current.metadata, sharedTranscriptLinks: result.ownedLinks,
+          } });
+        } catch {
+          result.warning = 'Some transcript links could not be recorded. Retry account activation to reconcile them.';
+        }
+      }
+      if (result.warning) this.sharedTranscriptWarnings.set(account.profileRef, result.warning);
+      else this.sharedTranscriptWarnings.delete(account.profileRef);
+      this.sharedTranscriptCounts.delete(account.profileRef);
+      if (result.sharedTranscripts != null) {
+        this.sharedTranscriptCounts.set(account.profileRef, {
+          at: this.now(), value: { sharedTranscripts: result.sharedTranscripts },
+        });
+      }
+      try {
+        const log = result.warning ? console.error : console.log;
+        log(`[modeldeck] shared transcripts: examined=${result.examined} created=${result.created} pruned=${result.pruned}`
+          + (result.warning ? `; ${result.warning}` : ` present=${result.sharedTranscripts}`));
+      } catch { /* Logging cannot undo a successful activation. */ }
+      return result.warning ? [result.warning] : [];
+    });
+    this.sharedTranscriptTasks.set(account.profileRef, task);
+    try { return await task; }
+    finally {
+      if (this.sharedTranscriptTasks.get(account.profileRef) === task) this.sharedTranscriptTasks.delete(account.profileRef);
+    }
+  }
+
+  async reconcileActiveTranscripts(provider = null) {
+    for (const [name, activeLink] of [['claude', this.claudeActiveLink], ['codex', this.codexActiveLink]]) {
+      if (provider && name !== provider) continue;
+      try {
+        if (!(await fs.promises.lstat(activeLink)).isSymbolicLink()) continue;
+        const target = path.resolve(path.dirname(activeLink), await fs.promises.readlink(activeLink));
+        const account = this.store.listAccounts().find((item) => item.provider === name && path.resolve(item.profileRef) === target);
+        if (account) await this.reconcileAccountTranscripts(account);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          try { console.error('[modeldeck] shared transcripts: active profile could not be inspected'); } catch { /* Best effort. */ }
+        }
+      }
+    }
+  }
+
+  async reconcileCreatedProfileTranscripts(account) {
+    // Legacy adoption needs an empty destination. Defer until its successful
+    // flip; that path calls the same reconciler after the rollback boundary.
+    if (account.provider === 'claude') {
+      try {
+        if (!(await fs.promises.lstat(this.claudeActiveLink)).isSymbolicLink()) return;
+      } catch (error) { if (error.code !== 'ENOENT') return; }
+    }
+    await this.reconcileAccountTranscripts(account);
+    await this.reconcileActiveTranscripts(account.provider);
+  }
+
+  async accountSharedTranscriptState(account) {
+    const cached = this.sharedTranscriptCounts.get(account.profileRef);
+    if (cached && this.now() - cached.at < 30_000) return cached.value;
+    const entry = {
+      at: this.now(),
+      value: sharedTranscriptState({ profilesDir: this.claudeProfilesDir, profileRef: account.profileRef }),
+    };
+    this.sharedTranscriptCounts.set(account.profileRef, entry);
+    return entry.value;
   }
 
   // Issue #66: counts running `claude` processes at activation time. Pinned
@@ -4417,8 +5078,9 @@ export class ModelDeckService {
           const { stdout } = await this.exec('/bin/launchctl', ['getenv', name], { timeout: 5_000, maxBuffer: 65_536 });
           const value = String(stdout ?? '').replace(/\n+$/, '');
           captured.launchd[name] = value === '' ? null : value;
-        } catch {
-          captured.launchd[name] = undefined;
+        } catch (error) {
+          // launchctl exits 1 with empty output when the variable is absent.
+          captured.launchd[name] = error.code === 1 && error.stdout === '' && error.stderr === '' ? null : undefined;
         }
       }
     }
@@ -4426,6 +5088,7 @@ export class ModelDeckService {
   }
 
   async restoreClaudeScopePins(captured) {
+    this.requireManaged('claude');
     if (!captured) return;
     const failures = [];
     if (captured.shellPin === null) {
@@ -4459,6 +5122,7 @@ export class ModelDeckService {
   }
 
   async scopeClaudeSecureStorage(profileRef) {
+    this.requireManaged('claude');
     const value = await fs.promises.realpath(profileRef);
     // Issue #66: refresh the shell pin first so new terminal sessions export
     // CLAUDE_CONFIG_DIR + CLAUDE_SECURESTORAGE_CONFIG_DIR (always the same
@@ -4526,6 +5190,7 @@ export class ModelDeckService {
   /// idempotent, so a consistent pair is untouched. No active profile (no
   /// symlink yet) means no pin to repair.
   async reconcileClaudeShellEnvFile() {
+    this.requireManaged('claude');
     let activeRealPath;
     try { activeRealPath = await this.realpath(this.claudeActiveLink); }
     catch (error) {
@@ -4537,6 +5202,7 @@ export class ModelDeckService {
   }
 
   async writeClaudeShellEnvFile(profileRealPath, proxyRouted = false) {
+    this.requireManaged('claude');
     const file = this.claudeShellEnvFile;
     // Issue #522: the Keychain service is resolved HERE, from the profile's
     // own recorded helper state, rather than passed by each caller — the
@@ -4554,6 +5220,22 @@ export class ModelDeckService {
     }
   }
 
+  async writeCodexShellEnvFile(profileRealPath) {
+    this.requireManaged('codex');
+    const file = this.codexShellEnvFile;
+    const temporary = `${file}.modeldeck-${crypto.randomUUID()}`;
+    try {
+      await fs.promises.mkdir(path.dirname(file), { recursive: true });
+      await fs.promises.writeFile(temporary, `if [ -z "${'${CODEX_HOME:-}'}" ]; then\n  export CODEX_HOME=${shellQuote(profileRealPath)}\nfi\n`, { mode: 0o600 });
+      await fs.promises.rename(temporary, file);
+    } finally { await fs.promises.rm(temporary, { force: true }); }
+  }
+
+  async installProviderShellHook(provider) {
+    this.requireManaged(provider);
+    return updateProviderShellHook({ target: this.configLintZshenvPath, provider, envFile: this[`${provider}ShellEnvFile`] });
+  }
+
   setDefaultAccount(provider, accountId) {
     const account = this.store.setDefault(provider, accountId);
     this.invalidateToolProbe();
@@ -4562,6 +5244,7 @@ export class ModelDeckService {
 
   async deleteAccount(accountId) {
     const account = this.store.getAccount(accountId);
+    if (account) this.assertNoProviderManagement(account.provider);
     await this.accountDetachProfile(account);
     const deleted = this.store.deleteAccount(accountId);
     if (deleted) {
@@ -4575,6 +5258,7 @@ export class ModelDeckService {
   }
 
   async activateCodexProfile(profileRef) {
+    this.requireManaged('codex');
     let activeStat = null;
     try { activeStat = await fs.promises.lstat(this.codexActiveLink); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -4594,6 +5278,7 @@ export class ModelDeckService {
       await fs.promises.unlink(temporaryLink).catch(() => {});
       throw new Error(`Codex account activation failed: ${errorMessage(error)}`);
     }
+    await this.writeCodexShellEnvFile(await fs.promises.realpath(profileRef));
   }
 
   async latestToolVersion(url) {
@@ -4654,6 +5339,7 @@ export class ModelDeckService {
 
   async accountAuthState(account) {
     if (!account?.profileRef) return 'unknown';
+    if (account.metadata?.claudeHomeNeedsVerification) return 'signin-required';
     if (account.provider === 'claude' && this.duplicateClaudeTokenAccountIds.has(account.id)) {
       return 'duplicate-token';
     }
@@ -4696,6 +5382,7 @@ export class ModelDeckService {
   // accountAuthState and never revisited here.
   signinReason(account, authState) {
     if (authState !== 'signin-required') return null;
+    if (account.metadata?.claudeHomeNeedsVerification) return 'missing';
     const lastError = account.id != null && this.accountRefreshErrors.get(account.id);
     if (lastError && SIGN_IN_REQUIRED_ERROR_PATTERN.test(lastError.message)) {
       return SIGN_IN_EXPIRED_ERROR_PATTERN.test(lastError.message) ? 'expired' : 'missing';
@@ -4900,14 +5587,13 @@ export class ModelDeckService {
       return cached.pending ? cached.pending : cached.value;
     }
     // Issue #539: the observation needs the proxy's raw `status` as well as
-    // the three-word health, because only `active` is a finished sign-in.
-    // proxy-relogin.mjs is untouched (#398) — the extra read happens here,
-    // over the same already-allowlisted fields.
+    // the health word, because only `active` is a finished sign-in.
+    // The extra read uses the same already-allowlisted fields.
     const probe = (async () => {
       try {
         const entries = await this.proxyReloginDriver.authFiles();
         return {
-          health: proxyCredentialHealthFromAuthFiles(entries),
+          health: proxyCredentialHealthFromAuthFiles(entries, now),
           active: proxyCredentialActiveIdentities(entries),
         };
       } catch {
@@ -4949,7 +5635,7 @@ export class ModelDeckService {
   //    Dating the repair to the last bad observation makes every failure the
   //    daemon cannot place before the sign-in keep the alert red.
   // 2. Only `active` is a finished sign-in. `refreshing` and `pending` map to
-  //    the same three-word health (nothing is broken yet), but claiming
+  //    the same `ok` health (nothing is broken yet), but claiming
   //    "signed in again" for a refresh nobody performed is exactly the false
   //    reassurance this issue exists to remove.
   observeProxyCredentialHealth(probe) {
@@ -4958,6 +5644,12 @@ export class ModelDeckService {
     const record = (provider, records) => {
       for (const [value, entry] of records) {
         const key = `${provider}:${value}`;
+        // A rate-limit reset is not a sign-in. Resting must not leave a
+        // broken observation that a later active verdict calls a repair.
+        if (entry.health === 'resting') {
+          this.proxyCredentialObservations.delete(key);
+          continue;
+        }
         const seen = this.proxyCredentialObservations.get(key);
         let lastBrokenAt = seen?.lastBrokenAt ?? null;
         let repairedAt = seen?.repairedAt ?? null;
@@ -5510,6 +6202,8 @@ export class ModelDeckService {
   /// settings.json and the shell env file is picked up by the next call
   /// instead of being redone or silently left half-applied.
   async migrateClaudeClientKeyHelper(accountId, input = {}) {
+    this.requireManaged('claude');
+    this.assertNoProviderManagement('claude');
     const account = this.store.getAccount(accountId);
     if (!account) throw serviceError('account not found', 404);
     if (account.provider !== 'claude') {
@@ -5663,6 +6357,8 @@ export class ModelDeckService {
   }
 
   async setProxyRouting(accountId, enabled) {
+    this.requireManaged('claude');
+    this.assertNoProviderManagement('claude');
     const account = this.store.getAccount(accountId);
     if (!account) throw serviceError('account not found', 404);
     if (account.provider !== 'claude') {
@@ -5689,6 +6385,7 @@ export class ModelDeckService {
   }
 
   async updateClaudeProxyRoutingSettings(account, profileRef, enabled) {
+    this.requireManaged('claude');
     this.assertClaudeProxyRoutingIdle(account.id);
     const settingsPath = path.join(profileRef, 'settings.json');
     let raw = null;
@@ -5935,8 +6632,13 @@ export class ModelDeckService {
         ? this.proxyReloginAvailabilityFor(account, proxyManagementKeyPresent)
         : null;
       const publicAccount = this.accountForPublicResponse(account);
+      const transcripts = account.provider === 'claude'
+        ? await this.accountSharedTranscriptState(account) : {};
+      const transcriptWarning = this.sharedTranscriptWarnings.get(account.profileRef);
       return {
         ...publicAccount,
+        ...transcripts,
+        ...(transcriptWarning ? { sharedTranscriptsWarning: transcriptWarning } : {}),
         authState,
         ...(signinReason ? { signinReason } : {}),
         ...(lastRefreshError ? { lastRefreshError } : {}),
@@ -5966,6 +6668,7 @@ export class ModelDeckService {
 
   accountForPublicResponse(account) {
     const metadata = { ...account.metadata };
+    delete metadata.sharedTranscriptLinks;
     if (metadata.claudeRenewal && typeof metadata.claudeRenewal === 'object') {
       metadata.claudeRenewal = { ...metadata.claudeRenewal };
       delete metadata.claudeRenewal.postExpiryGuardUntil;
@@ -5974,6 +6677,7 @@ export class ModelDeckService {
   }
 
   async providerActivationState(provider, activeLink, accounts) {
+    if (!this.isProviderManaged(provider)) return { state: 'unmanaged' };
     let activeStat;
     try { activeStat = await fs.promises.lstat(activeLink); }
     catch (error) {
@@ -6226,13 +6930,19 @@ export class ModelDeckService {
         ? this.proxyCredentialRepairedAt(account)
         : null;
       const repairedPending = isLaterInstant(repairedAt, streak.lastFailureAt);
+      // Issue #572, additive (the #149/#174 discipline — an older app simply
+      // keeps the red state): overload-class failures get the honest remedy
+      // and a marker the app renders in the #539 quiet style. Evidence
+      // clearing is untouched — no timer, a routed success still clears it.
+      const transient = memberBlackoutTransientStatus(streak.statusCode);
       alerts.push({
         accountId: account.id,
         provider: account.provider,
         label: account.label,
         ...streak,
         ...(repairedPending ? { repairedPending: true, repairedAt } : {}),
-        remedy: MEMBER_BLACKOUT_REMEDY,
+        ...(transient ? { transient: true } : {}),
+        remedy: transient ? MEMBER_BLACKOUT_TRANSIENT_REMEDY : MEMBER_BLACKOUT_REMEDY,
       });
     }
     alerts.sort((left, right) => (
@@ -6240,6 +6950,33 @@ export class ModelDeckService {
       || left.label.localeCompare(right.label)
     ));
     return { threshold: MEMBER_BLACKOUT_FAILURE_THRESHOLD, alerts };
+  }
+
+  providerManagementBlocked() {
+    const reasons = {};
+    for (const provider of ['claude', 'codex']) {
+      if (provider === 'claude' && this.isProviderManaged(provider)) {
+        reasons[provider] = CLAUDE_UNMANAGE_UNAVAILABLE_REASON;
+        continue;
+      }
+      try { this.assertProviderIdle(provider); }
+      catch (error) { reasons[provider] = error.message; continue; }
+      if (provider === 'claude' && this.store.getSettings().sharedUserScopeEnabled) {
+        reasons[provider] = 'Turn off shared Claude settings before changing account switching.';
+      } else if (this.isProviderManaged(provider)) {
+        const accounts = this.store.listAccounts().filter((account) => account.provider === provider);
+        if (accounts.length !== 1) reasons[provider] = 'Keep one account to turn off account switching.';
+        else {
+          try {
+            const home = this[`${provider}ActiveLink`];
+            if (!fs.lstatSync(home).isSymbolicLink() || fs.realpathSync(home) !== fs.realpathSync(accounts[0].profileRef)) {
+              reasons[provider] = 'Activate the remaining account before turning off account switching.';
+            }
+          } catch { reasons[provider] = 'Activate the remaining account before turning off account switching.'; }
+        }
+      }
+    }
+    return reasons;
   }
 
   async state() {
@@ -6256,6 +6993,8 @@ export class ModelDeckService {
       ...value,
       accounts,
       activation: { claude: claudeActivation, codex: codexActivation },
+      managed: { claude: this.isProviderManaged('claude'), codex: this.isProviderManaged('codex') },
+      managementBlocked: this.providerManagementBlocked(),
       claudeSecureStorage,
       scheduler: this.refreshSchedulerStatus(),
       usageQueue: this.usageQueueStatus(),
@@ -6394,6 +7133,19 @@ export class ModelDeckService {
     return resolved;
   }
 
+  // Public issue #2: the path every daemon-side spawn of a provider CLI
+  // should use. Absolute when PATH or the install-dir fallback can see the
+  // binary; otherwise the bare name unchanged, so the caller's own ENOENT
+  // handling still produces its "<CLI> is not installed" message rather
+  // than a resolver error the UI does not know how to word.
+  async spawnableToolPath(binary) {
+    try {
+      return await this.toolExecutablePath(binary);
+    } catch {
+      return binary;
+    }
+  }
+
   // Issue #2: the first executable match for `binary` in the known install
   // directories the daemon's static PATH cannot express, or '' when none.
   async toolPathFallback(binary) {
@@ -6506,7 +7258,7 @@ export class ModelDeckService {
     if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) throw new Error(`launch directory does not exist: ${cwd}`);
 
     if (provider === 'claude') {
-      const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+      const profileRef = this.providerProfileRef(account);
       // Adversarial review of #278, blocker 1: the MAPPED account decides
       // the credential, not the shell the launch happens from. A proxied
       // shell launching a direct account must not carry ModelDeck's proxy

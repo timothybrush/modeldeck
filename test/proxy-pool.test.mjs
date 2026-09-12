@@ -60,6 +60,7 @@ function fixture(t, { spawn, serviceOptions = {} } = {}) {
   fs.writeFileSync(path.join(cliproxyConfigDir, 'config.yaml'), 'port: 9137\n', { mode: 0o600 });
 
   const store = new Store(':memory:');
+  store.saveSettings({ claudeManaged: true, codexManaged: true });
   const claude = store.saveAccount({
     provider: 'claude',
     label: 'Pool Claude',

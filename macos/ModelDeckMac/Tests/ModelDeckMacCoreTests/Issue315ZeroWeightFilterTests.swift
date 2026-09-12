@@ -93,10 +93,7 @@ private func fixtureState() -> DeckState {
 @MainActor
 struct Issue315ZeroWeightFilterTests {
     private func freshDefaults() -> UserDefaults {
-        let suite = "issue315-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        return defaults
+        ScratchDefaults.make("issue315-tests")
     }
 
     // MARK: The predicate — a row hides exactly when it DISPLAYS ⑂ 0 (#317)

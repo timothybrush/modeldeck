@@ -174,9 +174,7 @@ struct PinWindowStatusModelTests {
     }
 
     @Test func deckModelPinStateReadsThroughTheSuffix() {
-        let suite = "pin-window-tests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
+        let defaults = ScratchDefaults.make("pin-window-tests")
         let deck = DeckPopoverModel(defaults: defaults)
         var written: [String] = []
         deck.onPinMenuBarAccount = { written.append($0) }

@@ -94,9 +94,8 @@ public enum ProxyRelogin {
         return "last \(alert.consecutiveFailures) \(request) failed\(status)"
     }
 
-    /// Wire evidence outranks the recorded credential — with one exception: a
-    /// BENCHED member is not broken, and signing in again would not un-bench
-    /// it (the same reason `credentialText` refuses to dress it up).
+    /// A benched or resting member needs no sign-in repair, even if a routed
+    /// failure streak remains. Signing in cannot lift either restriction.
     public static func credentialIsBroken(
         _ account: DeckAccount,
         routedFailures alert: MemberBlackoutAlert?
@@ -106,8 +105,12 @@ public enum ProxyRelogin {
         // the last failure in the streak. The streak still stands as measured
         // evidence — the banner stays up, softened — but there is nothing to
         // fix, so it promotes no repair on either surface.
-        guard let alert, !alert.isRepairedPending else { return false }
-        return account.proxyCredential?.lowercased() != "disabled"
+        // Issue #572: an overload-class streak gets the same demotion — the
+        // provider was overloaded, the credential is fine, and signing in
+        // again would fix nothing.
+        guard let alert, !alert.isRepairedPending, !alert.isTransient else { return false }
+        let credential = account.proxyCredential?.lowercased()
+        return credential != "disabled" && credential != "resting"
     }
 
     /// Issue #539: a settled sign-in outcome recorded BEFORE the credential
@@ -150,6 +153,11 @@ public enum ProxyRelogin {
             // Benched is not broken, and signing in again would not un-bench
             // it — say what it is instead of offering the wrong remedy.
             return "Benched in the proxy pool"
+        case "resting":
+            guard let detail = account.proxyCredentialDetail, let retryAt = instant(detail) else {
+                return "Rate limited · resting"
+            }
+            return "Rate limited · back at \(DateFormatter.localizedString(from: retryAt, dateStyle: .none, timeStyle: .short))"
         default:
             return nil
         }
@@ -162,6 +170,9 @@ public enum ProxyRelogin {
         for account: DeckAccount,
         routedFailures alert: MemberBlackoutAlert?
     ) -> String? {
+        if account.proxyCredential?.lowercased() == "resting" {
+            return credentialText(for: account)
+        }
         // Issue #539: the Settings row speaks the same soft sentence the deck
         // banner does rather than going quiet — one daemon answer, two
         // surfaces. Text only; the repair is not promoted here either.
@@ -360,6 +371,8 @@ public final class ProxyReloginModel: ObservableObject {
             display = .error(error)
         } else if let note, !staleOutcome {
             display = .note(note)
+        } else if account.proxyCredential?.lowercased() == "resting" {
+            display = .quiet
         } else if let reason = ProxyRelogin.unavailableReason(for: account) {
             display = .unavailable(reason: reason)
         } else if ProxyRelogin.isAvailable(for: account) {

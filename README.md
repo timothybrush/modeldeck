@@ -6,7 +6,7 @@
 
 A native macOS menu bar app + local daemon that tracks usage limits across
 all of your Claude Code and Codex CLI accounts — live "% left" meters,
-reset countdowns, and one-click account switching.
+reset countdowns, and optional account switching.
 
 **Local-first. No cloud backend. No telemetry. Your provider credentials
 are never copied, stored, or transmitted by ModelDeck.** The only secrets
@@ -54,8 +54,7 @@ ModelDeck puts all of it in your menu bar:
 - **Get warned before you hit the wall.** The menu bar icon shows a gold
   percentage when any account drops below your threshold, red when critical,
   and a macOS notification fires exactly once at the crossing — no nagging.
-- **Switch accounts in one click.** Activate a different account for new
-  CLI sessions without touching anything that's already running.
+- **Account switching is offered when you add a second login** — with one login per provider, ModelDeck never touches that provider’s home folder.
 
 ## Features
 
@@ -111,10 +110,10 @@ This is the point of the tool, so it's worth being explicit:
 |---|---|
 | Cloud services | **None.** No backend, no sync, no accounts. |
 | Telemetry | **None.** Nothing is phoned home, ever. |
-| Provider credentials | **Never copied or persisted by ModelDeck.** Sign-in happens in the provider's own browser flow, and credentials stay in the provider-managed profile/Keychain; ModelDeck uses them in place, at runtime, only for usage and auth-state reads. |
+| Provider credentials | Sign-in happens in the provider's own browser flow; credentials stay in the profile/Keychain. The one-time Codex profile directory migration moves existing homes into ModelDeck's data directory and retains an owner-only recovery backup there. |
 | ModelDeck's own secrets | A few Keychain items of its own, all locally generated: one random token that authorizes the app to the daemon's localhost API, plus — only if you use the managed proxy — one client key per profile (service `cli-proxy-api-client.<profile>`) that ModelDeck mints for its own local proxy. None contain provider data. |
 | Network | Daemon binds to `127.0.0.1` only. Outbound calls go solely to the providers you already use, with credentials they already hold. |
-| Removal | Removing an account deletes only ModelDeck's reference — never your Keychain entries or provider auth state. |
+| Removal | Removing an account deletes only ModelDeck's reference. Deleting ModelDeck's data directory also deletes its managed Codex profiles and migration backups; Keychain entries remain. Custom profile-directory overrides must be removed separately. |
 
 ## Install
 
@@ -143,10 +142,9 @@ flow.
 
 ## Uninstall
 
-First, what uninstalling **never** touches: `~/.claude`, `~/.codex`, and
-your provider credentials. Those belong to the CLIs and their own sign-in
-flows; every removal path below leaves them exactly as they are, and every
-account you added keeps working from its provider's point of view.
+Removing the app keeps its data for a reinstall. Optional data deletion below
+also removes managed profile homes and their sign-ins. Quit provider sessions
+first and keep a backup of any profiles you want to retain.
 
 **If you installed the DMG**
 
@@ -157,10 +155,12 @@ account you added keeps working from its provider's point of view.
 3. Optionally, delete the data ModelDeck kept (skip this if you might
    reinstall — it's what makes a reinstall pick up where you left off):
    - `~/Library/Application Support/ModelDeck` — settings, usage history,
-     and the isolated per-account profile homes ModelDeck created. Deleting
-     it removes those managed sign-ins; your own `~/.claude` and `~/.codex`
-     are not in here. (If you run the daemon with `MODELDECK_DATA_DIR` or
-     `MODELDECK_DB_PATH` set, delete those locations instead.)
+     and isolated per-account profile homes, including `codex-profiles` and
+     its migration backups. Deleting it removes those managed sign-ins;
+     activation symlinks such as `~/.codex` may then point at a missing home.
+     The migration leaves the empty `~/.codex-profiles` directory for you to
+     remove. If you use `MODELDECK_DATA_DIR`, `MODELDECK_DB_PATH`, or
+     `MODELDECK_CODEX_PROFILES_DIR`, remove those configured locations instead.
    - `~/Library/Preferences/app.modeldeck.mac.plist`,
      `~/Library/Caches/app.modeldeck.mac`, and (if you ever ran the
      from-source launch agent) `~/Library/LaunchAgents/ai.hermes.modeldeck.plist`.
